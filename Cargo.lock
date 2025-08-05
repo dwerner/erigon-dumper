@@ -985,6 +985,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "criterion",
+ "hex",
  "memmap2",
  "smol-potat",
  "tempfile",

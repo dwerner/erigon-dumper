@@ -3,7 +3,6 @@ pub mod types;
 pub mod reader;
 pub mod segment;
 pub mod decompress;
-#[cfg(test)]
 pub mod compress;
 
 pub use error::{Error, Result};

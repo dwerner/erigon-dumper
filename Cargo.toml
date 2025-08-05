@@ -22,6 +22,9 @@ tracing = "0.1"
 # Temp files (used in tests)
 tempfile = "3.14"
 
+# Hex encoding for display
+hex = "0.4"
+
 [dev-dependencies]
 criterion = "0.5"
 smol-potat = "1.1"  # Minimal async runtime for tests

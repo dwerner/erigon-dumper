@@ -14,6 +14,9 @@ pub enum Error {
     #[error("Decompression error: {0}")]
     DecompressionError(String),
     
+    #[error("Invalid format: {0}")]
+    InvalidFormat(String),
+    
     #[error("RLP decoding error: {0}")]
     RlpError(#[from] alloy_rlp::Error),
     

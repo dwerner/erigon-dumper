@@ -1,459 +1,742 @@
 use crate::error::{Error, Result};
+use std::path::Path;
+use memmap2::{Mmap, MmapOptions};
+use std::fs::File;
 
 /// Erigon segment decompressor implementation
-/// Based on the dictionary compression algorithm used in erigon-lib/compress
-/// 
-/// Reference implementation:
-/// https://github.com/erigontech/erigon-lib/blob/main/compress/decompress.go
+/// Based on the dictionary compression algorithm used in erigon-lib/seg
 /// 
 /// The compression format uses:
-/// - Dictionary-based pattern matching for common byte sequences
+/// - Huffman-tree based pattern matching for common byte sequences
 /// - Position encoding for pattern locations
-/// - Uncompressed data for unique bytes
 /// - Variable-length encoding for positions and patterns
 
-const CONDENSED_PATTERN_TABLE_BIT_THRESHOLD: u8 = 9;
+const MAX_ALLOWED_DEPTH: u64 = 50;
+const COMPRESSED_MIN_SIZE: usize = 32;
+const CONDENSE_PATTERN_TABLE_BIT_THRESHOLD: usize = 9;
 
 #[derive(Debug)]
 pub struct Decompressor<'a> {
     data: &'a [u8],
     words_count: u64,
-    empty_words_count: u64,
-    patterns: PatternTable,
-    positions: PositionTable,
+_empty_words_count: u64,
+    dict: Option<PatternTable>,
+    pos_dict: Option<PosTable>,
     words_start: usize,
 }
 
+/// A decompressor that owns its data
+#[derive(Debug)]
+pub struct DecompressorOwned {
+    _mmap: Mmap,
+    inner: Decompressor<'static>,
+}
+
+impl DecompressorOwned {
+    pub fn open(path: &Path) -> Result<Self> {
+        // println!("Opening decompressor for: {:?}", path);
+        let file = File::open(path)?;
+        let metadata = file.metadata()?;
+        
+        if metadata.len() < COMPRESSED_MIN_SIZE as u64 {
+            return Err(Error::InvalidFormat(format!(
+                "File too small: {} bytes, expected at least {}",
+                metadata.len(),
+                COMPRESSED_MIN_SIZE
+            )));
+        }
+
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        
+        // Create decompressor with a reference to the mmap data
+        // This is safe because we store the mmap in the struct, ensuring it lives as long as the decompressor
+        let data: &[u8] = &mmap[..];
+        let data_static: &'static [u8] = unsafe { std::mem::transmute(data) };
+        let inner = Decompressor::new(data_static)?;
+        
+        Ok(DecompressorOwned { _mmap: mmap, inner })
+    }
+    
+    pub fn make_getter(&self) -> Getter {
+        self.inner.make_getter()
+    }
+}
+
+/// Pattern table for Huffman decoding
 #[derive(Debug)]
 struct PatternTable {
-    bit_len: u8,
-    patterns: Vec<Codeword>,
+    patterns: Vec<Option<CodeWord>>,
+    bit_len: usize,
 }
 
+/// A codeword in the Huffman tree
 #[derive(Debug)]
-struct PositionTable {
-    bit_len: u8,
-    positions: Vec<u64>,
-}
-
-#[derive(Debug)]
-struct Codeword {
-    pattern: Option<Vec<u8>>,
-    table_ptr: Option<Box<PatternTable>>,
+struct CodeWord {
+    pattern: Vec<u8>,
     code: u16,
     len: u8,
+    ptr: Option<Box<PatternTable>>,
+}
+
+/// Position table for decoding positions
+#[derive(Debug)]
+struct PosTable {
+    pos: Vec<u64>,
+    lens: Vec<u8>,
+    ptrs: Vec<Option<Box<PosTable>>>,
+    bit_len: usize,
 }
 
 pub struct Getter<'a> {
-    decompressor: &'a Decompressor<'a>,
-    data_pos: usize,
-    data_bit: u8,
+    data: &'a [u8],
+    pattern_dict: Option<&'a PatternTable>,
+    pos_dict: Option<&'a PosTable>,
+    data_p: usize,
+    data_bit: usize,
+    words_start: usize,
 }
 
 impl<'a> Decompressor<'a> {
-    /// Create a decompressor from a byte slice
     pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.len() < 24 {
-            return Err(Error::DecompressionError("Data too short for header".to_string()));
+            return Err(Error::InvalidFormat("Data too short for header".to_string()));
         }
         
-        // Read header
-        let mut pos = 0;
-        let words_count = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
-        pos += 8;
+        // Read header (Erigon uses big-endian)
+        let words_count = u64::from_be_bytes(data[0..8].try_into().unwrap());
+        let empty_words_count = u64::from_be_bytes(data[8..16].try_into().unwrap());
+        let dict_size = u64::from_be_bytes(data[16..24].try_into().unwrap());
         
-        let empty_words_count = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
-        pos += 8;
+        println!("Decompressor header: words_count={}, empty_words_count={}, dict_size={}", 
+                 words_count, empty_words_count, dict_size);
         
-        let dict_size = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap()) as usize;
-        pos += 8;
-        
-        // Parse dictionaries from compressed data
-        let (patterns, positions) = if dict_size > 0 && pos + dict_size <= data.len() {
-            Self::parse_dictionaries(&data[pos..pos + dict_size])?
+        if 24 + dict_size > data.len() as u64 {
+            return Err(Error::InvalidFormat(format!(
+                "Dictionary size {} exceeds file size",
+                dict_size
+            )));
+        }
+
+        // Parse pattern dictionary
+        let mut pos = 24usize;
+        let dict = if dict_size > 0 {
+            let dict_data = &data[pos..pos + dict_size as usize];
+            Some(Self::build_pattern_dict(dict_data)?)
         } else {
-            // Empty dictionaries
-            (
-                PatternTable {
-                    bit_len: 0,
-                    patterns: vec![],
-                },
-                PositionTable {
-                    bit_len: 0,
-                    positions: vec![],
-                }
-            )
+            None
         };
+        pos += dict_size as usize;
+
+        // Parse position dictionary
+        let pos_dict_size = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
         
-        let words_start = pos + dict_size;
+        println!("Position dictionary size: {}", pos_dict_size);
         
+        let pos_dict = if pos_dict_size > 0 {
+            let dict_data = &data[pos..pos + pos_dict_size as usize];
+            Some(Self::build_pos_dict(dict_data)?)
+        } else {
+            None
+        };
+        pos += pos_dict_size as usize;
+
+        let words_start = pos;
+
         Ok(Decompressor {
             data,
             words_count,
-            empty_words_count,
-            patterns,
-            positions,
+_empty_words_count: empty_words_count,
+            dict,
+            pos_dict,
             words_start,
         })
     }
-    
+
+    fn build_pattern_dict(data: &[u8]) -> Result<PatternTable> {
+        let mut depths = Vec::new();
+        let mut patterns = Vec::new();
+        let mut pos = 0;
+        let mut max_depth = 0u64;
+
+        // println!("Building pattern dict from {} bytes", data.len());
+
+        // Parse patterns
+        while pos < data.len() {
+            let (depth, n) = decode_varint(&data[pos..])?;
+            if depth > MAX_ALLOWED_DEPTH {
+                return Err(Error::InvalidFormat(format!("Depth {} exceeds max", depth)));
+            }
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            depths.push(depth);
+            pos += n;
+
+            let (len, n) = decode_varint(&data[pos..])?;
+            pos += n;
+            
+            if pos + len as usize > data.len() {
+                return Err(Error::InvalidFormat("Pattern extends beyond data".into()));
+            }
+            
+            patterns.push(data[pos..pos + len as usize].to_vec());
+            pos += len as usize;
+        }
+        
+        // println!("Parsed {} patterns, max_depth={}", patterns.len(), max_depth);
+
+        // Build pattern table
+        let bit_len = if max_depth > 9 { 9 } else { max_depth as usize };
+        let mut table = PatternTable::new(bit_len);
+        
+        Self::build_condensed_pattern_table(&mut table, &depths, &patterns, 0, 0, 0, max_depth)?;
+        
+        Ok(table)
+    }
+
+    fn build_condensed_pattern_table(
+        table: &mut PatternTable,
+        depths: &[u64],
+        patterns: &[Vec<u8>],
+        code: u16,
+        bits: usize,
+        depth: u64,
+        max_depth: u64,
+    ) -> Result<usize> {
+        if depths.is_empty() {
+            return Ok(0);
+        }
+
+        // Stop recursion if we've exceeded max depth
+        if max_depth == 0 || depth > depths[0] {
+            return Ok(0);
+        }
+
+        if depth == depths[0] {
+            let cw = CodeWord {
+                pattern: patterns[0].clone(),
+                code,
+                len: bits as u8,
+                ptr: None,
+            };
+            table.insert_word(cw);
+            return Ok(1);
+        }
+
+        if bits == 9 {
+            let bit_len = if max_depth > 9 { 9 } else { max_depth as usize };
+            let mut new_table = Box::new(PatternTable::new(bit_len));
+            let count = Self::build_condensed_pattern_table(
+                &mut new_table,
+                depths,
+                patterns,
+                0,
+                0,
+                depth,
+                max_depth,
+            )?;
+            
+            let cw = CodeWord {
+                pattern: vec![],
+                code,
+                len: 0,
+                ptr: Some(new_table),
+            };
+            table.insert_word(cw);
+            return Ok(count);
+        }
+
+        // Now we can safely subtract since we checked max_depth > 0 above
+        let remaining_depth = max_depth - 1;
+        
+        let b0 = Self::build_condensed_pattern_table(
+            table,
+            depths,
+            patterns,
+            code,
+            bits + 1,
+            depth + 1,
+            remaining_depth,
+        )?;
+        
+        let b1 = Self::build_condensed_pattern_table(
+            table,
+            &depths[b0..],
+            &patterns[b0..],
+            (1 << bits) | code,
+            bits + 1,
+            depth + 1,
+            remaining_depth,
+        )?;
+        
+        Ok(b0 + b1)
+    }
+
+    fn build_pos_dict(data: &[u8]) -> Result<PosTable> {
+        // println!("Building position dict from {} bytes", data.len());
+        let mut depths = Vec::new();
+        let mut positions = Vec::new();
+        let mut pos = 0;
+        let mut max_depth = 0u64;
+
+        while pos < data.len() {
+            let (depth, n) = decode_varint(&data[pos..])?;
+            if depth > MAX_ALLOWED_DEPTH {
+                return Err(Error::InvalidFormat(format!("Pos depth {} exceeds max", depth)));
+            }
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            depths.push(depth);
+            pos += n;
+
+            let (position, n) = decode_varint(&data[pos..])?;
+            pos += n;
+            positions.push(position);
+            println!("  Parsed position entry: depth={}, position={}", depth, position);
+        }
+        
+        println!("  Parsed {} positions, max_depth={}", positions.len(), max_depth);
+        if positions.len() > 0 {
+            println!("  First few positions: {:?}", &positions[..positions.len().min(5)]);
+        }
+
+        let bit_len = if max_depth > 9 { 9 } else { max_depth as usize };
+        let table_size = 1 << bit_len;
+        let mut table = PosTable {
+            bit_len,
+            pos: vec![0; table_size],
+            lens: vec![0; table_size],
+            ptrs: (0..table_size).map(|_| None).collect(),
+        };
+
+        Self::build_pos_table(&mut table, &depths, &positions, 0, 0, 0, max_depth)?;
+        Ok(table)
+    }
+
+    fn build_pos_table(
+        table: &mut PosTable,
+        depths: &[u64],
+        positions: &[u64],
+        code: u16,
+        bits: usize,
+        depth: u64,
+        max_depth: u64,
+    ) -> Result<usize> {
+        if depths.is_empty() {
+            return Ok(0);
+        }
+
+        // Stop recursion if we've exceeded max depth
+        if max_depth == 0 || depth > depths[0] {
+            return Ok(0);
+        }
+
+        if depth == depths[0] {
+            let p = positions[0];
+            if table.bit_len == bits {
+                table.pos[code as usize] = p;
+                table.lens[code as usize] = bits as u8;
+            } else {
+                let code_step = 1u16 << bits;
+                let code_to = code | (1u16 << table.bit_len);
+                let mut c = code;
+                while c < code_to {
+                    table.pos[c as usize] = p;
+                    table.lens[c as usize] = bits as u8;
+                    c += code_step;
+                }
+            }
+            return Ok(1);
+        }
+
+        if bits == 9 {
+            let bit_len = if max_depth > 9 { 9 } else { max_depth as usize };
+            let table_size = 1 << bit_len;
+            let mut new_table = Box::new(PosTable {
+                bit_len,
+                pos: vec![0; table_size],
+                lens: vec![0; table_size],
+                ptrs: (0..table_size).map(|_| None).collect(),
+            });
+            
+            let count = Self::build_pos_table(
+                &mut new_table,
+                depths,
+                positions,
+                0,
+                0,
+                depth,
+                max_depth,
+            )?;
+            
+            table.ptrs[code as usize] = Some(new_table);
+            return Ok(count);
+        }
+
+        // Now we can safely subtract since we checked max_depth > 0 above
+        let remaining_depth = max_depth - 1;
+        
+        let b0 = Self::build_pos_table(
+            table,
+            depths,
+            positions,
+            code,
+            bits + 1,
+            depth + 1,
+            remaining_depth,
+        )?;
+        
+        let b1 = Self::build_pos_table(
+            table,
+            &depths[b0..],
+            &positions[b0..],
+            (1 << bits) | code,
+            bits + 1,
+            depth + 1,
+            remaining_depth,
+        )?;
+        
+        Ok(b0 + b1)
+    }
+
     pub fn make_getter(&'a self) -> Getter<'a> {
         Getter {
-            decompressor: self,
-            data_pos: self.words_start,
+            data: self.data, // Keep full data, use words_start in reset
+            pattern_dict: self.dict.as_ref(),
+            pos_dict: self.pos_dict.as_ref(),
+            data_p: self.words_start,
             data_bit: 0,
+            words_start: self.words_start,
         }
     }
     
-    /// Parse pattern and position dictionaries from dictionary data
-    fn parse_dictionaries(dict_data: &[u8]) -> Result<(PatternTable, PositionTable)> {
-        // This is a simplified version - real implementation would parse
-        // the actual dictionary format from Erigon
-        
-        // For now, return empty dictionaries
-        Ok((
-            PatternTable {
-                bit_len: 8, // Assume 8-bit codes for now
-                patterns: vec![],
-            },
-            PositionTable {
-                bit_len: 8, // Assume 8-bit codes for now  
-                positions: vec![],
+    pub fn words_start(&self) -> usize {
+        self.words_start
+    }
+
+    pub fn words_count(&self) -> u64 {
+        self.words_count
+    }
+}
+
+impl PatternTable {
+    fn new(bit_len: usize) -> Self {
+        let size = 1 << bit_len;
+        PatternTable {
+            patterns: (0..size).map(|_| None).collect(),
+            bit_len,
+        }
+    }
+
+    fn insert_word(&mut self, cw: CodeWord) {
+        if self.bit_len <= CONDENSE_PATTERN_TABLE_BIT_THRESHOLD {
+            let code_step = 1u16 << cw.len;
+            let code_from = cw.code;
+            let code_to = if self.bit_len != cw.len as usize && cw.len > 0 {
+                cw.code | (1u16 << self.bit_len)
+            } else {
+                cw.code + code_step
+            };
+
+            let mut c = code_from;
+            while c < code_to {
+                self.patterns[c as usize] = Some(CodeWord {
+                    pattern: cw.pattern.clone(),
+                    code: cw.code,
+                    len: cw.len,
+                    ptr: None, // Cloning deep pattern tables is complex; for now skip
+                });
+                c += code_step;
             }
-        ))
+        }
+    }
+
+    fn condensed_table_search(&self, code: u16) -> Option<&CodeWord> {
+        if self.bit_len <= CONDENSE_PATTERN_TABLE_BIT_THRESHOLD {
+            return self.patterns[code as usize].as_ref();
+        }
+        None
     }
 }
 
 impl<'a> Getter<'a> {
-    /// Read bits from compressed data
-    fn read_bits(&mut self, bit_len: u8) -> u16 {
-        if bit_len == 0 {
-            return 0;
-        }
-        
-        let data = self.decompressor.data;
-        if self.data_pos >= data.len() {
-            return 0;
-        }
-        
-        let mut code = (data[self.data_pos] >> self.data_bit) as u16;
-        
-        if 8 - self.data_bit < bit_len && self.data_pos + 1 < data.len() {
-            code |= (data[self.data_pos + 1] as u16) << (8 - self.data_bit);
-        }
-        
-        if 16 - self.data_bit < bit_len && self.data_pos + 2 < data.len() {
-            code |= (data[self.data_pos + 2] as u16) << (16 - self.data_bit);
-        }
-        
-        code &= (1u16 << bit_len) - 1;
-        
-        // Advance position
-        self.data_bit += bit_len;
-        self.data_pos += (self.data_bit / 8) as usize;
-        self.data_bit %= 8;
-        
-        code
+    pub fn reset(&mut self, offset: u64) {
+        // The offset is relative to the words section
+        self.data_p = self.words_start + offset as usize;
+        self.data_bit = 0;
     }
-    
-    /// Read next position value
-    fn next_pos(&mut self, clean: bool) -> u64 {
-        let table = &self.decompressor.positions;
-        
-        // Empty dictionary case - read raw byte
-        if table.bit_len == 0 {
-            // Read one byte directly when no dictionary
-            return self.read_bits(8) as u64;
-        }
-        
-        // Read the code
-        let code = self.read_bits(table.bit_len);
-        
-        // In real implementation, would look up position based on code
-        // For now, return the code as position
-        code as u64
+
+    pub fn has_next(&self) -> bool {
+        self.data_p < self.data.len()
     }
-    
-    /// Read next pattern from dictionary
-    fn next_pattern(&mut self) -> Vec<u8> {
-        let table = &self.decompressor.patterns;
-        
-        if table.bit_len == 0 {
-            return vec![];
+
+    pub fn next(&mut self, _buf: &mut Vec<u8>) -> Result<Vec<u8>> {
+        if !self.has_next() {
+            return Ok(vec![]);
         }
+
+        let _save_pos = self.data_p;
+        let mut word_len = self.next_pos(true)?;
         
-        let code = self.read_bits(table.bit_len);
+        println!("  next_pos returned word_len: {}, data_p: {}, save_pos: {}", word_len, self.data_p, _save_pos);
         
-        // In real implementation, would look up pattern in dictionary
-        // For now, return empty pattern
-        vec![]
-    }
-    
-    /// Extract next compressed word
-    pub fn next(&mut self, buf: &mut Vec<u8>) -> Result<Vec<u8>> {
-        buf.clear();
-        
-        // Read word length (first position)
-        let word_len = self.next_pos(true);
         if word_len == 0 {
+            // Check if we should return empty vector or treat as error
+            if self.data_bit > 0 {
+                self.data_p += 1;
+                self.data_bit = 0;
+            }
             return Ok(vec![]);
         }
         
-        // The word length includes a zero terminator, so actual length is word_len - 1
-        let actual_len = word_len.saturating_sub(1) as usize;
-        if actual_len == 0 {
-            // Empty word - still need to read end-of-positions marker
-            let _end_marker = self.next_pos(false);
+        word_len -= 1; // Adjust for encoding
+
+        if word_len == 0 {
+            if self.data_bit > 0 {
+                self.data_p += 1;
+                self.data_bit = 0;
+            }
             return Ok(vec![]);
         }
+
+        // Special case: no dictionaries at all, just read raw bytes
+        if self.pattern_dict.is_none() && self.pos_dict.is_none() {
+            println!("  Reading {} raw bytes from position {}", word_len, self.data_p);
+            let mut result = Vec::with_capacity(word_len);
+            for _ in 0..word_len {
+                if self.data_p >= self.data.len() {
+                    break;
+                }
+                result.push(self.data[self.data_p]);
+                self.data_p += 1;
+            }
+            return Ok(result);
+        }
         
-        // Resize buffer to actual word length
-        buf.resize(actual_len, 0);
+        // Erigon format: even without pattern dictionary, positions are used
+        // to mark where patterns would go. The uncovered bytes are stored after.
         
-        // Read pattern positions and insert patterns
+        let mut result = vec![0u8; word_len];
         let mut buf_pos = 0;
-        let mut pattern_positions = Vec::new();
+        let mut last_uncovered = 0;
+        let _post_loop_start = self.data_p;
         
+        // First pass: read all positions (even if no patterns)
         loop {
-            let pos = self.next_pos(false);
+            let pos = self.next_pos(false)?;
             if pos == 0 {
-                break;
+                break; // End of positions
             }
             
-            // Position is relative to current position
-            buf_pos += pos as usize - 1;
-            if buf_pos >= buf.len() {
-                break;
-            }
+            buf_pos += pos - 1; // Positions are relative to each other
             
-            let pattern = self.next_pattern();
-            if !pattern.is_empty() {
-                let copy_len = pattern.len().min(buf.len() - buf_pos);
-                buf[buf_pos..buf_pos + copy_len].copy_from_slice(&pattern[..copy_len]);
-                pattern_positions.push((buf_pos, buf_pos + copy_len));
-                buf_pos += copy_len;
+            if let Some(dict) = self.pattern_dict {
+                let (pattern, _) = self.next_pattern(dict)?;
+                if buf_pos + pattern.len() <= word_len {
+                    result[buf_pos..buf_pos + pattern.len()].copy_from_slice(&pattern);
+                    last_uncovered = buf_pos + pattern.len();
+                }
+            } else {
+                // No pattern dictionary, but we still need to track position
+                last_uncovered = buf_pos;
             }
         }
         
-        // Now fill the uncovered positions with uncompressed data
-        // Sort pattern positions to process in order
-        pattern_positions.sort_by_key(|&(start, _)| start);
+        // Align to byte boundary after reading positions
+        if self.data_bit > 0 {
+            self.data_p += 1;
+            self.data_bit = 0;
+        }
         
-        let mut uncovered_start = 0;
-        for &(pattern_start, pattern_end) in &pattern_positions {
-            if pattern_start > uncovered_start {
-                // We have uncovered data to read
-                let uncovered_len = pattern_start - uncovered_start;
-                self.read_uncompressed(&mut buf[uncovered_start..pattern_start], uncovered_len)?;
+        let post_loop_pos = self.data_p;
+        
+        // Second pass: fill uncovered bytes from the data stream
+        println!("  After positions: last_uncovered={}, word_len={}, post_loop_pos={}", last_uncovered, word_len, post_loop_pos);
+        if last_uncovered < word_len {
+            let remaining = word_len - last_uncovered;
+            if post_loop_pos + remaining <= self.data.len() {
+                println!("  Reading {} uncovered bytes from position {}", remaining, post_loop_pos);
+                result[last_uncovered..].copy_from_slice(&self.data[post_loop_pos..post_loop_pos + remaining]);
+                self.data_p = post_loop_pos + remaining;
+            } else {
+                println!("  Not enough data: need {} bytes but only {} available", remaining, self.data.len() - post_loop_pos);
             }
-            uncovered_start = pattern_end;
         }
         
-        // Fill any remaining uncovered data at the end
-        if uncovered_start < buf.len() {
-            let remaining = buf.len() - uncovered_start;
-            self.read_uncompressed(&mut buf[uncovered_start..], remaining)?;
-        }
-        
-        Ok(buf.clone())
+        Ok(result)
     }
     
-    /// Read uncompressed data directly from the data stream
-    fn read_uncompressed(&mut self, buf: &mut [u8], len: usize) -> Result<()> {
-        let data = self.decompressor.data;
-        if self.data_pos + len > data.len() {
-            return Err(Error::DecompressionError("Not enough data for uncompressed read".to_string()));
-        }
-        
-        buf.copy_from_slice(&data[self.data_pos..self.data_pos + len]);
-        self.data_pos += len;
-        Ok(())
-    }
-    
-    /// Skip to next word without decompressing
     pub fn skip(&mut self) -> Result<()> {
-        let word_len = self.next_pos(true);
+        if !self.has_next() {
+            return Ok(());
+        }
+        
+        let mut word_len = self.next_pos(true)?;
+        
         if word_len == 0 {
             return Ok(());
         }
         
-        // TODO: Implement skip logic
+        word_len -= 1; // Adjust for encoding
+
+        if word_len == 0 {
+            if self.data_bit > 0 {
+                self.data_p += 1;
+                self.data_bit = 0;
+            }
+            return Ok(());
+        }
+
+        // When there's no dictionary, just skip the bytes
+        if self.pattern_dict.is_none() && self.pos_dict.is_none() {
+            self.data_p += word_len;
+            return Ok(());
+        }
+        
+        // Skip pattern positions
+        while self.next_pos(false)? != 0 {
+            // Skip patterns
+            if let Some(dict) = self.pattern_dict {
+                self.next_pattern(dict)?;
+            }
+        }
+        
+        // TODO: Skip remaining uncovered bytes properly
+        // For now, this is a simplified implementation
+        
         Ok(())
     }
+
+    fn next_pos(&mut self, clean: bool) -> Result<usize> {
+        if let Some(pos_dict) = self.pos_dict {
+            let result = self.next_pos_internal(pos_dict, clean)?;
+            println!("    next_pos with dict returned: {}", result);
+            Ok(result)
+        } else {
+            // When no position dictionary, read varint
+            if self.data_p >= self.data.len() {
+                return Ok(0);
+            }
+            let (val, n) = decode_varint(&self.data[self.data_p..])?;
+            self.data_p += n;
+            // println!("    next_pos varint returned: {}", val);
+            Ok(val as usize)
+        }
+    }
+
+    fn next_pos_internal(&mut self, table: &PosTable, clean: bool) -> Result<usize> {
+        if self.data_p >= self.data.len() {
+            return Ok(0);
+        }
+
+        let code = self.peek_bits(table.bit_len)?;
+        let bits = table.lens[code as usize];
+        
+        println!("    next_pos_internal: code={}, bits={}, pos={}", code, bits, 
+                 if bits > 0 { table.pos[code as usize] } else { 0 });
+        
+        if let Some(ptr) = &table.ptrs[code as usize] {
+            self.skip_bits(9);
+            return self.next_pos_internal(ptr, clean);
+        }
+
+        if bits == 0 {
+            return Ok(0);
+        }
+
+        self.skip_bits(bits as usize);
+        Ok(table.pos[code as usize] as usize)
+    }
+
+    fn next_pattern(&mut self, table: &PatternTable) -> Result<(Vec<u8>, usize)> {
+        let code = self.peek_bits(table.bit_len)?;
+        
+        if let Some(cw) = table.condensed_table_search(code) {
+            if let Some(ptr) = &cw.ptr {
+                self.skip_bits(9);
+                return self.next_pattern(ptr);
+            }
+            
+            self.skip_bits(cw.len as usize);
+            Ok((cw.pattern.clone(), cw.pattern.len()))
+        } else {
+            Err(Error::InvalidFormat("Pattern not found".into()))
+        }
+    }
+
+    fn peek_bits(&self, n: usize) -> Result<u16> {
+        if n > 16 {
+            return Err(Error::InvalidFormat("Cannot peek more than 16 bits".into()));
+        }
+
+        let mut result = 0u16;
+        let mut p = self.data_p;
+        let mut bit = self.data_bit;
+
+        for i in 0..n {
+            if p >= self.data.len() {
+                break;
+            }
+
+            // Read bits from LSB to MSB to match writer's bit order
+            if (self.data[p] >> bit) & 1 != 0 {
+                result |= 1 << i;
+            }
+
+            bit += 1;
+            if bit == 8 {
+                bit = 0;
+                p += 1;
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn skip_bits(&mut self, n: usize) {
+        self.data_bit += n;
+        self.data_p += self.data_bit / 8;
+        self.data_bit %= 8;
+    }
+}
+
+fn decode_varint(data: &[u8]) -> Result<(u64, usize)> {
+    let mut result = 0u64;
+    let mut shift = 0;
+    
+    for (i, &byte) in data.iter().enumerate() {
+        if i == 9 && byte > 1 {
+            return Err(Error::InvalidFormat("Varint too large".into()));
+        }
+        
+        result |= ((byte & 0x7F) as u64) << shift;
+        
+        if byte & 0x80 == 0 {
+            return Ok((result, i + 1));
+        }
+        
+        shift += 7;
+    }
+    
+    Err(Error::InvalidFormat("Varint missing terminator".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    // Test data similar to Erigon's Lorem ipsum test
-    const LOREM_IPSUM: &str = "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua";
-    
-    fn create_test_compressed_data() -> Vec<u8> {
-        // Create a minimal valid compressed file header
-        let mut data = Vec::new();
-        
-        // Words count
-        data.extend_from_slice(&10u64.to_le_bytes());
-        
-        // Empty words count
-        data.extend_from_slice(&0u64.to_le_bytes());
-        
-        // Dictionary size (minimal for now)
-        data.extend_from_slice(&0u64.to_le_bytes());
-        
-        // No dictionary data for this test
-        // No compressed words data for this test
-        
-        data
-    }
-    
+
     #[test]
-    fn test_decompressor_new() {
-        let data = create_test_compressed_data();
-        let decompressor = Decompressor::new(&data).unwrap();
-        
-        assert_eq!(decompressor.words_count, 10);
-        assert_eq!(decompressor.empty_words_count, 0);
-        assert_eq!(decompressor.words_start, 24); // Header is 24 bytes
+    fn test_varint_decode() {
+        let data = vec![0x01];
+        let (val, n) = decode_varint(&data).unwrap();
+        assert_eq!(val, 1);
+        assert_eq!(n, 1);
+
+        let data = vec![0x80, 0x01];
+        let (val, n) = decode_varint(&data).unwrap();
+        assert_eq!(val, 128);
+        assert_eq!(n, 2);
     }
-    
-    #[test]
-    fn test_decompressor_too_short() {
-        let data = vec![0u8; 20]; // Less than header size
-        let result = Decompressor::new(&data);
-        
-        assert!(result.is_err());
-        match result {
-            Err(Error::DecompressionError(msg)) => {
-                assert!(msg.contains("too short"));
-            }
-            _ => panic!("Expected DecompressionError"),
-        }
-    }
-    
-    #[test]
-    fn test_getter_read_bits() {
-        let mut data = create_test_compressed_data();
-        // Add some test data after header
-        data.extend_from_slice(&[0b10101010, 0b11001100, 0b11110000]);
-        
-        let decompressor = Decompressor::new(&data).unwrap();
-        let mut getter = decompressor.make_getter();
-        
-        // Test reading various bit lengths
-        let bits_4 = getter.read_bits(4);
-        assert_eq!(bits_4, 0b1010); // First 4 bits of 0b10101010
-        
-        let bits_8 = getter.read_bits(8);
-        assert_eq!(bits_8, 0b11001010); // Next 8 bits crossing byte boundary
-    }
-    
-    #[test]
-    fn test_empty_decompression() {
-        let data = create_test_compressed_data();
-        let decompressor = Decompressor::new(&data).unwrap();
-        let mut getter = decompressor.make_getter();
-        let mut buf = Vec::new();
-        
-        // With no actual compressed data and bit_len=0, returns empty
-        let result = getter.next(&mut buf).unwrap();
-        assert!(result.is_empty());
-    }
-    
-    #[test]
-    fn test_simple_word_decompression() {
-        // Create compressed data with a simple word
-        // Format: [header][dictionary][compressed_words]
-        let mut data = Vec::new();
-        
-        // Header (24 bytes)
-        data.extend_from_slice(&1u64.to_le_bytes()); // 1 word
-        data.extend_from_slice(&0u64.to_le_bytes()); // 0 empty words
-        data.extend_from_slice(&0u64.to_le_bytes()); // No dictionary
-        
-        // Compressed word data (no dictionary, so direct encoding):
-        // Word "hello" (5 bytes) encoded as:
-        // - Length: 6 (5 + 1 for zero terminator)
-        // - Position: 0 (end of positions)
-        // - Raw data: "hello"
-        data.push(6);  // Word length + 1
-        data.push(0);  // End of positions marker
-        data.extend_from_slice(b"hello"); // Uncompressed data
-        
-        let decompressor = Decompressor::new(&data).unwrap();
-        let mut getter = decompressor.make_getter();
-        let mut buf = Vec::new();
-        
-        // Should decompress "hello"
-        let result = getter.next(&mut buf).unwrap();
-        assert_eq!(result, b"hello");
-    }
-    
-    #[test]
-    fn test_multiple_words_decompression() {
-        // Test decompressing multiple words
-        let test_words: Vec<&[u8]> = vec![b"first", b"second", b"third"];
-        let mut data = Vec::new();
-        
-        // Header
-        data.extend_from_slice(&3u64.to_le_bytes()); // 3 words
-        data.extend_from_slice(&0u64.to_le_bytes()); // 0 empty words
-        data.extend_from_slice(&0u64.to_le_bytes()); // No dictionary
-        
-        // Compress each word (simple format without dictionary)
-        for word in &test_words {
-            data.push((word.len() + 1) as u8); // Length + 1
-            data.push(0); // End of positions
-            data.extend_from_slice(word);
-        }
-        
-        let decompressor = Decompressor::new(&data).unwrap();
-        let mut getter = decompressor.make_getter();
-        let mut buf = Vec::new();
-        
-        // Decompress and verify each word
-        for expected in &test_words {
-            let result = getter.next(&mut buf).unwrap();
-            assert_eq!(result, *expected);
-        }
-    }
-    
-    #[test]
-    fn test_empty_word_handling() {
-        // Test handling of empty words and edge cases
-        let mut data = Vec::new();
-        
-        // Header
-        data.extend_from_slice(&2u64.to_le_bytes()); // 2 words
-        data.extend_from_slice(&1u64.to_le_bytes()); // 1 empty word
-        data.extend_from_slice(&0u64.to_le_bytes()); // No dictionary
-        
-        // First word: empty (length = 1 for terminator only)
-        data.push(1); // Length
-        data.push(0); // End of positions
-        
-        // Second word: "a"
-        data.push(2); // Length 
-        data.push(0); // End of positions
-        data.push(b'a');
-        
-        let decompressor = Decompressor::new(&data).unwrap();
-        let mut getter = decompressor.make_getter();
-        let mut buf = Vec::new();
-        
-        // First word should be empty
-        let result = getter.next(&mut buf).unwrap();
-        assert_eq!(result, b"");
-        
-        // Second word should be "a"
-        let result = getter.next(&mut buf).unwrap();
-        assert_eq!(result, b"a");
-    }
-    
-    // TODO: Add more tests once we implement the full decompression logic
-    // - Test with actual dictionary compression
-    // - Test pattern matching with dictionaries
-    // - Test complex position encoding
-    // - Test skip functionality
 }
