@@ -91,9 +91,15 @@ pub struct Getter<'a> {
     data: &'a [u8],
     pattern_dict: Option<&'a PatternTable>,
     pos_dict: Option<&'a PosTable>,
-    data_p: usize,
+    // Position reading (for position bits at beginning of word section)
+    pos_p: usize,
+    pos_bit: usize,
+    // Data reading (for word data, set after all position bits are read)
+    pub data_p: usize, // Make public for Go test compatibility
     data_bit: usize,
     words_start: usize,
+    // Track if we've started reading data (vs positions)
+    data_mode: bool,
 }
 
 impl<'a> Decompressor<'a> {
@@ -304,6 +310,7 @@ _empty_words_count: empty_words_count,
 
         let bit_len = if max_depth > 9 { 9 } else { max_depth as usize };
         let table_size = 1 << bit_len;
+        println!("Creating pos table: bit_len={}, table_size={}, max_depth={}", bit_len, table_size, max_depth);
         let mut table = PosTable {
             bit_len,
             pos: vec![0; table_size],
@@ -328,16 +335,19 @@ _empty_words_count: empty_words_count,
             return Ok(0);
         }
 
-        // Stop recursion if we've exceeded max depth
-        if max_depth == 0 || depth > depths[0] {
+        // Stop recursion if we've gone past the next item
+        if depth > depths[0] {
             return Ok(0);
         }
 
         if depth == depths[0] {
             let p = positions[0];
+            println!("    Building pos table entry: code={}, bits={}, pos={}, table.bit_len={}", 
+                     code, bits, p, table.bit_len);
             if table.bit_len == bits {
                 table.pos[code as usize] = p;
                 table.lens[code as usize] = bits as u8;
+                println!("      Set table[{}] = pos={}, bits={}", code, p, bits);
             } else {
                 let code_step = 1u16 << bits;
                 let code_to = code | (1u16 << table.bit_len);
@@ -345,6 +355,7 @@ _empty_words_count: empty_words_count,
                 while c < code_to {
                     table.pos[c as usize] = p;
                     table.lens[c as usize] = bits as u8;
+                    println!("      Set table[{}] = pos={}, bits={}", c, p, bits);
                     c += code_step;
                 }
             }
@@ -406,9 +417,14 @@ _empty_words_count: empty_words_count,
             data: self.data, // Keep full data, use words_start in reset
             pattern_dict: self.dict.as_ref(),
             pos_dict: self.pos_dict.as_ref(),
+            // Position reading starts at beginning of word section
+            pos_p: self.words_start,
+            pos_bit: 0,
+            // Data reading will be set when we switch to data mode
             data_p: self.words_start,
             data_bit: 0,
             words_start: self.words_start,
+            data_mode: false,
         }
     }
     
@@ -466,105 +482,292 @@ impl<'a> Getter<'a> {
         // The offset is relative to the words section
         self.data_p = self.words_start + offset as usize;
         self.data_bit = 0;
+        self.pos_p = self.words_start + offset as usize;
+        self.pos_bit = 0;
+        self.data_mode = false;
     }
 
     pub fn has_next(&self) -> bool {
         self.data_p < self.data.len()
     }
 
-    pub fn next(&mut self, _buf: &mut Vec<u8>) -> Result<Vec<u8>> {
-        if !self.has_next() {
-            return Ok(vec![]);
-        }
-
-        let _save_pos = self.data_p;
-        let mut word_len = self.next_pos(true)?;
+    pub fn match_prefix(&mut self, prefix: &[u8]) -> bool {
+        // Port of Go's MatchPrefix - saves position and restores it after checking
+        let save_data_p = self.data_p;
+        let save_data_bit = self.data_bit;
+        let save_pos_p = self.pos_p;
+        let save_pos_bit = self.pos_bit;
+        let save_data_mode = self.data_mode;
         
-        println!("  next_pos returned word_len: {}, data_p: {}, save_pos: {}", word_len, self.data_p, _save_pos);
-        
-        if word_len == 0 {
-            // Check if we should return empty vector or treat as error
-            if self.data_bit > 0 {
-                self.data_p += 1;
-                self.data_bit = 0;
-            }
-            return Ok(vec![]);
-        }
-        
-        word_len -= 1; // Adjust for encoding
-
-        if word_len == 0 {
-            if self.data_bit > 0 {
-                self.data_p += 1;
-                self.data_bit = 0;
-            }
-            return Ok(vec![]);
-        }
-
-        // Special case: no dictionaries at all, just read raw bytes
-        if self.pattern_dict.is_none() && self.pos_dict.is_none() {
-            println!("  Reading {} raw bytes from position {}", word_len, self.data_p);
-            let mut result = Vec::with_capacity(word_len);
-            for _ in 0..word_len {
-                if self.data_p >= self.data.len() {
-                    break;
+        // Always restore position after prefix check (Go behavior)  
+        let result = match self.next(&mut Vec::new()) {
+            Ok(word) => {
+                if prefix.is_empty() {
+                    true  // Empty prefix always matches
+                } else {
+                    word.len() >= prefix.len() && &word[..prefix.len()] == prefix
                 }
-                result.push(self.data[self.data_p]);
-                self.data_p += 1;
             }
-            return Ok(result);
+            Err(_) => false,
+        };
+        
+        // Always restore position (Go MatchPrefix never advances)
+        self.data_p = save_data_p;
+        self.data_bit = save_data_bit;
+        self.pos_p = save_pos_p;
+        self.pos_bit = save_pos_bit;
+        self.data_mode = save_data_mode;
+        
+        result
+    }
+
+    pub fn match_cmp(&mut self, target: &[u8]) -> i32 {
+        // Port of Go's MatchCmp - compares and only advances on exact match
+        let save_data_p = self.data_p;
+        let save_data_bit = self.data_bit;
+        let save_pos_p = self.pos_p;
+        let save_pos_bit = self.pos_bit;
+        let save_data_mode = self.data_mode;
+        
+        match self.next(&mut Vec::new()) {
+            Ok(word) => {
+                let result = if word.as_slice() < target {
+                    -1
+                } else if word.as_slice() > target {
+                    1
+                } else {
+                    0  // Exact match
+                };
+                
+                // Go behavior: restore position unless exact match
+                if result != 0 {
+                    self.data_p = save_data_p;
+                    self.data_bit = save_data_bit;
+                    self.pos_p = save_pos_p;
+                    self.pos_bit = save_pos_bit;
+                    self.data_mode = save_data_mode;
+                }
+                // If result == 0 (exact match), keep advanced position
+                
+                result
+            }
+            Err(_) => {
+                // Restore position on error
+                self.data_p = save_data_p;
+                self.data_bit = save_data_bit;
+                self.pos_p = save_pos_p;
+                self.pos_bit = save_pos_bit;
+                self.data_mode = save_data_mode;
+                -1
+            }
+        }
+    }
+
+    pub fn next_with_pos(&mut self, buf: &mut Vec<u8>) -> Result<(Vec<u8>, u64)> {
+        let start_pos = self.data_p;
+        let word = self.next(buf)?;
+        let end_pos = self.data_p;
+        Ok((word, end_pos as u64))
+    }
+
+    pub fn next(&mut self, buf: &mut Vec<u8>) -> Result<Vec<u8>> {
+        println!("    Starting next() at data_p={}, data_bit={} (pos_p={}, pos_bit={})", 
+                 self.data_p, self.data_bit, self.pos_p, self.pos_bit);
+        if self.pos_p < self.data.len() {
+            println!("      Byte at pos_p: 0x{:02x} = 0b{:08b}", self.data[self.pos_p], self.data[self.pos_p]);
         }
         
-        // Erigon format: even without pattern dictionary, positions are used
-        // to mark where patterns would go. The uncovered bytes are stored after.
+        let word_len = self.next_pos(true)?;
+        println!("    Raw word_len from position: {}", word_len);
+        // Position 0 is valid - it represents empty words. Subtract 1 to get actual word length.
+        let word_len = if word_len > 0 { word_len - 1 } else { 0 };
+        println!("    Adjusted word length: {}", word_len);
         
+        if word_len == 0 {
+            // Handle empty word case - still need to read terminator but no data
+            // For the case with no patterns, use the simple NextUncompressed approach
+            if self.pattern_dict.is_none() {
+                // Read terminator position (should be 0)
+                let terminator = self.next_pos(false)?;
+                println!("    Empty word - read terminator: {}", terminator);
+                
+                // Switch to data mode if needed but don't read any data
+                if !self.data_mode {
+                    self.data_mode = true;
+                    if self.pos_bit > 0 {
+                        self.data_p = self.pos_p + 1;
+                    } else {
+                        self.data_p = self.pos_p;
+                    }
+                    self.data_bit = 0;
+                    println!("    Empty word - switched to data_mode: data_p={}", self.data_p);
+                }
+                
+                return Ok(vec![]);
+            } else {
+                // Handle empty word with patterns - same logic but no data to read
+                loop {
+                    let pos = self.next_pos(false)?;
+                    if pos == 0 {
+                        break;
+                    }
+                    // Skip any patterns
+                    if let Some(dict) = self.pattern_dict {
+                        self.next_pattern(dict)?;
+                    }
+                }
+                
+                // Switch to data mode if needed
+                if !self.data_mode {
+                    self.data_mode = true;
+                    if self.pos_bit > 0 {
+                        self.data_p = self.pos_p + 1;
+                    } else {
+                        self.data_p = self.pos_p;
+                    }
+                    self.data_bit = 0;
+                    println!("    Empty word with patterns - switched to data_mode: data_p={}", self.data_p);
+                }
+                
+                return Ok(vec![]);
+            }
+        }
+        
+        // For the case with no patterns, use the simple NextUncompressed approach
+        if self.pattern_dict.is_none() {
+            // Read terminator position (should be 0)
+            let terminator = self.next_pos(false)?;
+            println!("    Read terminator: {}", terminator);
+            
+            // Switch to data mode if this is the first time reading data
+            if !self.data_mode {
+                self.data_mode = true;
+                // Initialize data pointer to current position stream location
+                // After reading all position bits, we're positioned at start of data
+                if self.pos_bit > 0 {
+                    self.data_p = self.pos_p + 1;
+                } else {
+                    self.data_p = self.pos_p;
+                }
+                self.data_bit = 0;
+                println!("    Switched to data_mode: data_p={}", self.data_p);
+            }
+            
+            println!("    Reading {} bytes from data_p={}", word_len, self.data_p);
+            
+            // Read word data directly
+            if self.data_p + word_len > self.data.len() {
+                return Err(Error::InvalidFormat("Word extends beyond data".into()));
+            }
+            
+            let word = self.data[self.data_p..self.data_p + word_len].to_vec();
+            self.data_p += word_len;
+            
+            println!("    Returning word: {:?} ('{}')", word, String::from_utf8_lossy(&word));
+            return Ok(word);
+        }
+        
+        // Handle pattern dictionary case - implement the full two-pass algorithm from Go
+        let save_pos_p = self.pos_p;
+        let save_pos_bit = self.pos_bit;
+        
+        let buf_offset = 0; // Since we're returning a new Vec, start at 0
         let mut result = vec![0u8; word_len];
-        let mut buf_pos = 0;
-        let mut last_uncovered = 0;
-        let _post_loop_start = self.data_p;
         
-        // First pass: read all positions (even if no patterns)
+        // First pass: fill in the patterns
+        let mut buf_pos = 0;
+        let mut pattern_count = 0;
         loop {
             let pos = self.next_pos(false)?;
+            println!("    First pass: read pos={}", pos);
             if pos == 0 {
-                break; // End of positions
+                println!("    First pass: terminator found, ending loop");
+                break;
+            }
+            
+            pattern_count += 1;
+            if pattern_count > 100 { // Safety check
+                return Err(Error::InvalidFormat("Too many patterns, possible infinite loop".into()));
             }
             
             buf_pos += pos - 1; // Positions are relative to each other
+            println!("    First pass: buf_pos now = {}", buf_pos);
             
             if let Some(dict) = self.pattern_dict {
-                let (pattern, _) = self.next_pattern(dict)?;
-                if buf_pos + pattern.len() <= word_len {
+                let pattern = self.next_pattern(dict)?;
+                println!("    First pass: pos={}, pattern={:?} ('{}')", pos, pattern, String::from_utf8_lossy(&pattern));
+                if buf_pos < result.len() && buf_pos + pattern.len() <= result.len() {
                     result[buf_pos..buf_pos + pattern.len()].copy_from_slice(&pattern);
-                    last_uncovered = buf_pos + pattern.len();
+                    println!("      Copied pattern to buf_pos={}", buf_pos);
+                } else {
+                    println!("      Pattern out of bounds: buf_pos={}, pattern_len={}, result_len={}", buf_pos, pattern.len(), result.len());
                 }
-            } else {
-                // No pattern dictionary, but we still need to track position
-                last_uncovered = buf_pos;
             }
         }
         
-        // Align to byte boundary after reading positions
-        if self.data_bit > 0 {
-            self.data_p += 1;
+        // Switch to data mode after reading all positions
+        if !self.data_mode {
+            self.data_mode = true;
+            if self.pos_bit > 0 {
+                self.data_p = self.pos_p + 1;
+            } else {
+                self.data_p = self.pos_p;
+            }
             self.data_bit = 0;
+            println!("    Pattern case - switched to data_mode: data_p={}", self.data_p);
         }
-        
         let post_loop_pos = self.data_p;
         
-        // Second pass: fill uncovered bytes from the data stream
-        println!("  After positions: last_uncovered={}, word_len={}, post_loop_pos={}", last_uncovered, word_len, post_loop_pos);
-        if last_uncovered < word_len {
-            let remaining = word_len - last_uncovered;
-            if post_loop_pos + remaining <= self.data.len() {
-                println!("  Reading {} uncovered bytes from position {}", remaining, post_loop_pos);
-                result[last_uncovered..].copy_from_slice(&self.data[post_loop_pos..post_loop_pos + remaining]);
-                self.data_p = post_loop_pos + remaining;
-            } else {
-                println!("  Not enough data: need {} bytes but only {} available", remaining, self.data.len() - post_loop_pos);
+        // Reset position stream for second pass
+        self.pos_p = save_pos_p;
+        self.pos_bit = save_pos_bit;
+        self.next_pos(true)?; // Reset huffman reader state
+        
+        // Second pass: fill uncovered bytes
+        buf_pos = 0;
+        let mut last_uncovered = 0;
+        let mut post_loop_offset = 0;
+        
+        loop {
+            let pos = self.next_pos(false)?;
+            if pos == 0 {
+                break;
+            }
+            
+            buf_pos += pos - 1;
+            
+            // Fill gap before pattern with uncovered data
+            if buf_pos > last_uncovered {
+                let dif = buf_pos - last_uncovered;
+                if post_loop_pos + post_loop_offset + dif <= self.data.len() {
+                    result[last_uncovered..buf_pos].copy_from_slice(
+                        &self.data[post_loop_pos + post_loop_offset..post_loop_pos + post_loop_offset + dif]
+                    );
+                    post_loop_offset += dif;
+                }
+            }
+            
+            if let Some(dict) = self.pattern_dict {
+                let pattern = self.next_pattern(dict)?;
+                last_uncovered = buf_pos + pattern.len();
             }
         }
         
+        // Fill remaining uncovered bytes at the end
+        if word_len > last_uncovered {
+            let dif = word_len - last_uncovered;
+            if post_loop_pos + post_loop_offset + dif <= self.data.len() {
+                result[last_uncovered..word_len].copy_from_slice(
+                    &self.data[post_loop_pos + post_loop_offset..post_loop_pos + post_loop_offset + dif]
+                );
+                post_loop_offset += dif;
+            }
+        }
+        
+        self.data_p = post_loop_pos + post_loop_offset;
+        self.data_bit = 0;
+        
+        println!("    Pattern case - returning word: {:?} ('{}')", result, String::from_utf8_lossy(&result));
         Ok(result)
     }
     
@@ -626,43 +829,91 @@ impl<'a> Getter<'a> {
         }
     }
 
-    fn next_pos_internal(&mut self, table: &PosTable, clean: bool) -> Result<usize> {
-        if self.data_p >= self.data.len() {
-            return Ok(0);
-        }
-
-        let code = self.peek_bits(table.bit_len)?;
-        let bits = table.lens[code as usize];
+    fn next_pos_internal(&mut self, table: &PosTable, _clean: bool) -> Result<usize> {
+        // Always use position stream for position reading
+        // Note: For position-only data (no patterns), we don't need byte alignment
         
-        println!("    next_pos_internal: code={}, bits={}, pos={}", code, bits, 
-                 if bits > 0 { table.pos[code as usize] } else { 0 });
-        
-        if let Some(ptr) = &table.ptrs[code as usize] {
-            self.skip_bits(9);
-            return self.next_pos_internal(ptr, clean);
+        if table.bit_len == 0 {
+            return Ok(table.pos[0] as usize);
         }
-
-        if bits == 0 {
-            return Ok(0);
-        }
-
-        self.skip_bits(bits as usize);
-        Ok(table.pos[code as usize] as usize)
-    }
-
-    fn next_pattern(&mut self, table: &PatternTable) -> Result<(Vec<u8>, usize)> {
-        let code = self.peek_bits(table.bit_len)?;
         
-        if let Some(cw) = table.condensed_table_search(code) {
-            if let Some(ptr) = &cw.ptr {
-                self.skip_bits(9);
-                return self.next_pattern(ptr);
+        loop {
+            if self.pos_p >= self.data.len() {
+                return Ok(0);
             }
             
-            self.skip_bits(cw.len as usize);
-            Ok((cw.pattern.clone(), cw.pattern.len()))
-        } else {
-            Err(Error::InvalidFormat("Pattern not found".into()))
+            // Read bits from the position stream
+            let mut code = (self.data[self.pos_p] >> self.pos_bit) as u16;
+            if 8 - self.pos_bit < table.bit_len && (self.pos_p + 1) < self.data.len() {
+                code |= (self.data[self.pos_p + 1] as u16) << (8 - self.pos_bit);
+            }
+            code &= (1u16 << table.bit_len) - 1;
+            
+            let l = table.lens[code as usize];
+            println!("    next_pos_internal: pos_p={}, pos_bit={}, code={}, bits={}, pos={}", 
+                     self.pos_p, self.pos_bit, code, l, 
+                     if l > 0 { table.pos[code as usize] } else { 0 });
+            
+            if l == 0 {
+                // Follow pointer to deeper table
+                if let Some(ptr) = &table.ptrs[code as usize] {
+                    self.pos_bit += 9;
+                    self.pos_p += self.pos_bit / 8;
+                    self.pos_bit %= 8;
+                    return self.next_pos_internal(ptr, false);
+                } else {
+                    return Ok(0);
+                }
+            } else {
+                // Found position
+                self.pos_bit += l as usize;
+                let pos = table.pos[code as usize];
+                self.pos_p += self.pos_bit / 8;
+                self.pos_bit %= 8;
+                return Ok(pos as usize);
+            }
+        }
+    }
+
+    fn next_pattern(&mut self, table: &PatternTable) -> Result<Vec<u8>> {
+        if table.bit_len == 0 {
+            return Ok(table.patterns[0].as_ref().map(|cw| cw.pattern.clone()).unwrap_or_default());
+        }
+        
+        loop {
+            if self.data_p >= self.data.len() {
+                return Ok(vec![]);
+            }
+            
+            // Read bits like Go version
+            let mut code = (self.data[self.data_p] >> self.data_bit) as u16;
+            if 8 - self.data_bit < table.bit_len && (self.data_p + 1) < self.data.len() {
+                code |= (self.data[self.data_p + 1] as u16) << (8 - self.data_bit);
+            }
+            code &= (1u16 << table.bit_len) - 1;
+            
+            if let Some(cw) = table.condensed_table_search(code) {
+                let l = cw.len;
+                if l == 0 {
+                    // Follow pointer to deeper table
+                    if let Some(ptr) = &cw.ptr {
+                        self.data_bit += 9;
+                        self.data_p += self.data_bit / 8;
+                        self.data_bit %= 8;
+                        return self.next_pattern(ptr);
+                    } else {
+                        return Ok(vec![]);
+                    }
+                } else {
+                    // Found pattern
+                    self.data_bit += l as usize;
+                    self.data_p += self.data_bit / 8;
+                    self.data_bit %= 8;
+                    return Ok(cw.pattern.clone());
+                }
+            } else {
+                return Err(Error::InvalidFormat("Pattern not found".into()));
+            }
         }
     }
 

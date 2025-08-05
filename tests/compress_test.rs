@@ -6,6 +6,7 @@ use std::path::Path;
 #[test]
 fn test_compress_empty_dict() {
     // Port of Go's TestCompressEmptyDict
+    // Original: https://github.com/erigontech/erigon/blob/main/erigon-lib/seg/compress_test.go#L33-L67
     let dir = TempDir::new().unwrap();
     let file_path = dir.path().join("compressed.seg");
     
@@ -31,6 +32,7 @@ fn test_compress_empty_dict() {
 
 fn prepare_dict(dir: &Path) -> std::path::PathBuf {
     // Port of Go's prepareDict helper
+    // Original: https://github.com/erigontech/erigon/blob/main/erigon-lib/seg/compress_test.go#L83-L119
     let file_path = dir.join("compressed.seg");
     
     let mut cfg = CompressorCfg::default();
@@ -56,6 +58,7 @@ fn prepare_dict(dir: &Path) -> std::path::PathBuf {
 #[test] 
 fn test_compress_dict1() {
     // Port of Go's TestCompressDict1
+    // Original: https://github.com/erigontech/erigon/blob/main/erigon-lib/seg/compress_test.go#L121-L185
     let dir = TempDir::new().unwrap();
     let file_path = prepare_dict(dir.path());
     

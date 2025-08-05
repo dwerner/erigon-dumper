@@ -286,6 +286,14 @@ pub struct Compressor {
     position_counts: HashMap<u64, u64>,
 }
 
+// Pattern match result for a single word
+#[derive(Debug, Clone)]
+struct PatternMatch {
+    position: usize,      // Position in word where pattern starts
+    pattern_id: usize,    // Index in pattern dictionary
+    length: usize,        // Length of the matched pattern
+}
+
 impl Compressor {
     pub fn new(
         _log_prefix: &str,
@@ -621,6 +629,55 @@ impl Compressor {
         Ok(lookup)
     }
 
+
+    // Cover a word with patterns - port of Go's coverWordByPatterns logic
+    fn cover_word_with_patterns(&self, word: &[u8], dict: &PatternDict) -> Vec<PatternMatch> {
+        let mut matches = Vec::new();
+        
+        if dict.patterns.is_empty() || word.is_empty() {
+            return matches;
+        }
+        
+        // Simple pattern matching - find all occurrences of each pattern
+        for (pattern_id, pattern_data) in dict.patterns.iter().enumerate() {
+            if pattern_data.data.is_empty() {
+                continue;
+            }
+            
+            // Find all occurrences of this pattern in the word
+            let mut pos = 0;
+            while pos + pattern_data.data.len() <= word.len() {
+                if &word[pos..pos + pattern_data.data.len()] == &pattern_data.data {
+                    matches.push(PatternMatch {
+                        position: pos,
+                        pattern_id,
+                        length: pattern_data.data.len(),
+                    });
+                    // Skip overlapping matches for now (can be optimized later)
+                    pos += pattern_data.data.len();
+                } else {
+                    pos += 1;
+                }
+            }
+        }
+        
+        // Sort matches by position
+        matches.sort_by_key(|m| m.position);
+        
+        // Remove overlapping matches (keep first match at each position)
+        let mut filtered_matches = Vec::new();
+        let mut last_end = 0;
+        
+        for m in matches {
+            if m.position >= last_end {
+                last_end = m.position + m.length;
+                filtered_matches.push(m);
+            }
+        }
+        
+        filtered_matches
+    }
+
     fn write_compressed_words(&mut self, file: &mut BufWriter<File>, dict: &PatternDict, pos_dict: &HashMap<u64, Position>) -> Result<()> {
         println!("Writing {} compressed words, dict has {} patterns", self.words_count, dict.patterns.len());
         println!("Position dictionary has {} entries", pos_dict.len());
@@ -635,9 +692,10 @@ impl Compressor {
             let mut output_buffer = Vec::new();
             let mut bit_writer = BitWriter::new(&mut output_buffer);
             
-            // First pass: write all positions
-            let mut words_data = Vec::new();
-            for _ in 0..self.words_count {
+            // Process each word and write compressed data
+            let mut all_word_data = Vec::new();
+            
+            for word_idx in 0..self.words_count {
                 let len_encoded = read_varint(&mut reader)?;
                 let _is_compressed = (len_encoded & 1) == 0;
                 let len = (len_encoded >> 1) as usize;
@@ -647,46 +705,97 @@ impl Compressor {
                     reader.read_exact(&mut word)?;
                 }
                 
-                let position = (len + 1) as u64;
-                println!("Encoding position {} for word of len {}", position, len);
+                println!("Processing word {}: {:?} (len={})", word_idx, String::from_utf8_lossy(&word), len);
                 
-                // Write word length + 1 as position
-                if let Some(pos_entry) = pos_dict.get(&position) {
-                    println!("  Position {} -> code={:b} bits={}", position, pos_entry.code, pos_entry.code_bits);
+                // 1. Write word length + 1 as position
+                let word_len_pos = (len + 1) as u64;
+                if let Some(pos_entry) = pos_dict.get(&word_len_pos) {
+                    println!("  Word length position {} -> code={:b} bits={}", word_len_pos, pos_entry.code, pos_entry.code_bits);
                     bit_writer.write_bits(pos_entry.code, pos_entry.code_bits)?;
                 } else {
-                    return Err(Error::InvalidFormat(format!("Position {} not in dictionary", position)));
+                    return Err(Error::InvalidFormat(format!("Word length position {} not in dictionary", word_len_pos)));
                 }
                 
-                // Write terminator (position 0)
-                // In the Go code, position 0 means end of positions for this word
-                if dict.patterns.is_empty() {
-                    // No patterns, so we need to write 0 position to indicate end
-                    if let Some(zero_entry) = pos_dict.get(&0) {
-                        println!("  Terminator 0 -> code={:b} bits={}", zero_entry.code, zero_entry.code_bits);
-                        bit_writer.write_bits(zero_entry.code, zero_entry.code_bits)?;
+                // 2. Find pattern matches in this word
+                let pattern_matches = self.cover_word_with_patterns(&word, dict);
+                println!("  Found {} pattern matches", pattern_matches.len());
+                
+                // 3. Write pattern positions (if any)
+                let mut pattern_data = Vec::new();
+                let mut last_pos = 0u64;
+                
+                for pattern_match in &pattern_matches {
+                    // Write relative position (Go uses relative positions)
+                    let relative_pos = (pattern_match.position as u64 + 1) - last_pos;
+                    last_pos = pattern_match.position as u64 + 1;
+                    
+                    println!("    Pattern {} at pos {}, relative_pos={}", pattern_match.pattern_id, pattern_match.position, relative_pos);
+                    
+                    if let Some(pos_entry) = pos_dict.get(&relative_pos) {
+                        println!("      Relative position {} -> code={:b} bits={}", relative_pos, pos_entry.code, pos_entry.code_bits);
+                        bit_writer.write_bits(pos_entry.code, pos_entry.code_bits)?;
                     } else {
-                        // If 0 is not in dictionary, we have a problem
-                        // Let's add it to our position counts
-                        println!("Warning: No zero terminator in position dictionary");
+                        println!("      Warning: Relative position {} not in dictionary, skipping pattern", relative_pos);
+                        continue;
+                    }
+                    
+                    // Store pattern data to write later
+                    pattern_data.push(pattern_match.pattern_id);
+                }
+                
+                // 4. Write terminator (position 0)
+                if let Some(zero_entry) = pos_dict.get(&0) {
+                    println!("  Terminator 0 -> code={:b} bits={}", zero_entry.code, zero_entry.code_bits);
+                    bit_writer.write_bits(zero_entry.code, zero_entry.code_bits)?;
+                } else {
+                    println!("  Warning: No zero terminator in position dictionary");
+                }
+                
+                // 5. Calculate uncovered bytes
+                let mut uncovered_bytes = Vec::new();
+                let mut covered_positions = vec![false; word.len()];
+                
+                // Mark covered positions
+                for pattern_match in &pattern_matches {
+                    for i in 0..pattern_match.length {
+                        if pattern_match.position + i < covered_positions.len() {
+                            covered_positions[pattern_match.position + i] = true;
+                        }
                     }
                 }
                 
-                words_data.push(word);
+                // Collect uncovered bytes
+                for (i, &byte) in word.iter().enumerate() {
+                    if i >= covered_positions.len() || !covered_positions[i] {
+                        uncovered_bytes.push(byte);
+                    }
+                }
+                
+                println!("  Uncovered bytes: {} out of {}", uncovered_bytes.len(), word.len());
+                
+                all_word_data.push((pattern_data, uncovered_bytes));
             }
             
-            // Flush bit writer
+            // Flush position bits
             bit_writer.flush()?;
             
-            // Write bit-encoded positions
+            // Write all position bits
             file.write_all(&output_buffer)?;
             
-            // Write word data
-            for word in words_data {
-                file.write_all(&word)?;
+            // Now write pattern codes and uncovered data
+            // TODO: This needs to be Huffman encoded too, but for now write as raw data
+            for (pattern_codes, uncovered_bytes) in all_word_data {
+                // Write pattern codes (this should be Huffman encoded in the real implementation)
+                for pattern_id in pattern_codes {
+                    file.write_all(&[pattern_id as u8])?; // Simplified - should be Huffman encoded
+                }
+                
+                // Write uncovered bytes
+                file.write_all(&uncovered_bytes)?;
             }
+            
         } else {
-            // No position dictionary - use varints
+            // No position dictionary - use varints (simpler case)
             let mut buf = Vec::new();
             for _ in 0..self.words_count {
                 let len_encoded = read_varint(&mut reader)?;
