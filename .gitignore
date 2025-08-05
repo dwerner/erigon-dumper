@@ -1,0 +1,7 @@
+/target
+erigon-bin/erigon_v3.0.15_linux_amd64
+erigon-bin/erigon_v3.0.15_linux_amd64.tar.gz
+023070-023071.tgz
+test_data/logs/downloader.log
+test_data/downloader
+test_data/snapshots/preverified.toml

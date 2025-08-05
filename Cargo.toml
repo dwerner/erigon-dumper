@@ -1,0 +1,27 @@
+[package]
+name = "erigon-dumper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core dependencies
+alloy-primitives = "0.8"
+alloy-consensus = "0.8"
+alloy-rpc-types = "0.8"
+alloy-rlp = "0.3"
+
+# Zero-copy and memory mapping
+memmap2 = "0.9"
+bytemuck = { version = "1.20", features = ["derive"] }
+bytes = "1.8"
+
+# Error handling
+thiserror = "2.0"
+tracing = "0.1"
+
+# Temp files (used in tests)
+tempfile = "3.14"
+
+[dev-dependencies]
+criterion = "0.5"
+smol-potat = "1.1"  # Minimal async runtime for tests
