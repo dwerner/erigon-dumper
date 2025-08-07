@@ -28,3 +28,4 @@ hex = "0.4"
 [dev-dependencies]
 criterion = "0.5"
 smol-potat = "1.1"  # Minimal async runtime for tests
+crc32fast = "1.4"  # For checksum tests matching Go

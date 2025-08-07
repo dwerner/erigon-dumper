@@ -1,4 +1,4 @@
-use erigon_dumper::compress::{Compressor, CompressorCfg};
+use erigon_dumper::compress::{Compressor, Cfg};
 use erigon_dumper::decompress::DecompressorOwned;
 use tempfile::TempDir;
 use std::path::Path;
@@ -19,7 +19,7 @@ fn prepare_lorem_dict(dir: &Path) -> std::path::PathBuf {
     // Port of Go's prepareLoremDict - simplified for debugging
     let file_path = dir.join("lorem_compressed.seg");
     
-    let mut cfg = CompressorCfg::default();
+    let mut cfg = Cfg::default();
     cfg.min_pattern_score = 1000; // High score so fewer patterns are selected for easier debugging
     cfg.workers = 2;
     
@@ -74,7 +74,7 @@ fn test_pattern_compression_decompression(test_name: &str, words: &[&[u8]], expe
     let dir = TempDir::new().unwrap();
     let file_path = dir.path().join(format!("{}.seg", test_name));
     
-    let mut cfg = CompressorCfg::default();
+    let mut cfg = Cfg::default();
     cfg.min_pattern_score = 1; // Very low to ensure pattern selection
     cfg.min_pattern_len = 2;   // Short patterns
     cfg.max_pattern_len = 10;
@@ -114,7 +114,7 @@ fn test_no_patterns_first() {
     let dir = TempDir::new().unwrap();
     let file_path = dir.path().join("no_patterns.seg");
     
-    let mut cfg = CompressorCfg::default();
+    let mut cfg = Cfg::default();
     cfg.min_pattern_score = 10000; // Very high to prevent pattern selection
     cfg.workers = 1;
     
@@ -179,7 +179,7 @@ fn test_compress_empty_dict() {
     let dir = TempDir::new().unwrap();
     let file_path = dir.path().join("compressed.seg");
     
-    let mut cfg = CompressorCfg::default();
+    let mut cfg = Cfg::default();
     cfg.min_pattern_score = 100; // Port exact config from Go test
     
     let mut compressor = Compressor::new("test_compress_empty_dict", &file_path, dir.path(), cfg).unwrap();
@@ -207,7 +207,7 @@ fn test_compress_empty_dict() {
 fn prepare_dict(dir: &Path) -> std::path::PathBuf {
     let file_path = dir.join("compressed.seg");
     
-    let mut cfg = CompressorCfg::default();
+    let mut cfg = Cfg::default();
     cfg.min_pattern_score = 1; // Port exact config from Go test
     cfg.workers = 2;
     
