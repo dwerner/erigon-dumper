@@ -5,8 +5,8 @@ use std::io::{Write, BufWriter, BufReader, Read};
 use std::collections::{HashMap, BinaryHeap};
 use std::cmp::Ordering;
 
-// Configuration matching Go's Cfg struct
-pub struct CompressorCfg {
+// Cfg matches Go's Cfg struct exactly
+pub struct Cfg {
     pub min_pattern_score: u64,
     pub min_pattern_len: usize,
     pub max_pattern_len: usize,
@@ -16,10 +16,10 @@ pub struct CompressorCfg {
     pub workers: usize,
 }
 
-impl Default for CompressorCfg {
+impl Default for Cfg {
     fn default() -> Self {
         // Match Go's DefaultCfg
-        CompressorCfg {
+        Cfg {
             min_pattern_score: 1024,
             min_pattern_len: 5,
             max_pattern_len: 128,
@@ -87,26 +87,30 @@ impl RawWordsFile {
     }
 }
 
-/// Pattern represents a byte sequence found in data
-#[derive(Clone, Debug)]
+// word matches Go's word type ([]byte)
+type Word = Vec<u8>;
+
+// Pattern struct matching Go's Pattern
+#[derive(Clone)]
 struct Pattern {
-    data: Vec<u8>,
-    score: u64,
-    depth: u64,
+    word: Vec<u8>,      // []byte
+    score: u64,         // uint64
+    uses: u64,          // uint64
+    code: u64,          // uint64
+    code_bits: usize,   // int
+    depth: usize,       // int
 }
 
-/// PatternDict holds patterns for dictionary compression
-struct PatternDict {
-    patterns: Vec<Pattern>,
+// PatternHuff matches Go's PatternHuff struct (Huffman tree node)
+struct PatternHuff {
+    p0: Option<Box<Pattern>>,         // *Pattern
+    p1: Option<Box<Pattern>>,         // *Pattern
+    h0: Option<Box<PatternHuff>>,     // *PatternHuff
+    h1: Option<Box<PatternHuff>>,     // *PatternHuff
+    uses: u64,                        // uint64
+    tie_breaker: u64,                 // uint64
 }
 
-impl PatternDict {
-    fn new() -> Self {
-        PatternDict {
-            patterns: Vec::new(),
-        }
-    }
-}
 
 /// Position represents a position value with its usage count
 #[derive(Clone, Debug)]
@@ -271,7 +275,7 @@ impl PartialOrd for PositionHuff {
 
 /// Main Compressor struct matching Go implementation
 pub struct Compressor {
-    cfg: CompressorCfg,
+    cfg: Cfg,
     output_file: PathBuf,
     tmp_out_file_path: PathBuf,
     uncompressed_file: RawWordsFile,
@@ -299,7 +303,7 @@ impl Compressor {
         _log_prefix: &str,
         output_file: &Path,
         tmp_dir: &Path,
-        cfg: CompressorCfg,
+        cfg: Cfg,
     ) -> Result<Self> {
         let tmp_out_file_path = output_file.with_extension("seg.tmp");
         let uncompressed_path = tmp_dir.join(
@@ -397,8 +401,15 @@ impl Compressor {
         // This is needed for marking end of positions in each word
         self.position_counts.entry(0).or_insert(self.words_count);
         
-        // Build dictionary from patterns
-        let dict = self.build_dictionary()?;
+        // Build dictionary from patterns first
+        let mut dict = self.build_dictionary()?;
+        
+        // Add pattern positions that will be needed during compression
+        // This mimics Go's approach in coverWordByPatterns where posMap is updated
+        self.collect_pattern_positions(&mut dict)?;
+        
+        // Rebuild Huffman codes now that we have actual usage statistics
+        self.rebuild_huffman_codes(&mut dict)?;
         
         // Write compressed file
         self.write_compressed_file(&dict)?;
@@ -409,7 +420,7 @@ impl Compressor {
         Ok(())
     }
 
-    fn build_dictionary(&self) -> Result<PatternDict> {
+    fn build_dictionary(&self) -> Result<Vec<Pattern>> {
         let mut patterns = Vec::new();
         
         println!("Building dictionary from {} pattern scores, min_score={}", 
@@ -435,9 +446,12 @@ impl Compressor {
                 
                 if !normal_pattern.is_empty() {
                     patterns.push(Pattern {
-                        data: normal_pattern,
+                        word: normal_pattern,
                         score,
                         depth: 0, // Will be assigned during Huffman tree building
+                        uses: 1, // Initialize with 1 to ensure all patterns have some usage
+                        code: 0, // Stable pattern ID - will be assigned next
+                        code_bits: 0, // Will be assigned during Huffman tree building
                     });
                 }
             }
@@ -445,28 +459,96 @@ impl Compressor {
         
         println!("Selected {} patterns before sorting and truncation", patterns.len());
         
-        // Sort by score descending
+        // Sort by score descending (like Go's dictBuilder.ForEach order)
         patterns.sort_by(|a, b| b.score.cmp(&a.score));
         
-        // Limit to max_dict_patterns, but also impose a reasonable limit
+        // Limit to max_dict_patterns
         let max_patterns = std::cmp::min(self.cfg.max_dict_patterns, 1000);
         patterns.truncate(max_patterns);
         
         println!("Final dictionary has {} patterns after truncation (max={})", 
                  patterns.len(), self.cfg.max_dict_patterns);
         
-        // For simple implementation, assign depths with very reasonable limits
-        // (Real implementation would build Huffman tree)
-        // Keep depths very small to avoid deep recursion
-        const MAX_PATTERN_DEPTH: u64 = 10; // Much smaller for safety
+        // Assign stable pattern codes (like Go's code2pattern indices)
+        // This matches Go's: code: uint64(len(code2pattern))
+        let mut code_to_pattern = Vec::new();
         for (i, pattern) in patterns.iter_mut().enumerate() {
-            pattern.depth = ((i % MAX_PATTERN_DEPTH as usize) + 1) as u64;
+            pattern.code = i as u64; // Stable pattern ID (index in code2pattern equivalent)
+            code_to_pattern.push(i); // Maps stable code -> index in patterns array
+            
+            println!("  Assigning stable pattern code {}: '{}'", pattern.code, String::from_utf8_lossy(&pattern.word));
+        }
+
+        // Clone patterns for Huffman processing (will be sorted by usage for Huffman tree)
+        let mut huffman_patterns = patterns.clone();
+        
+        // Simulate pattern usage for Huffman tree building (Go uses actual usage)
+        // For now, use the scores as usage approximation
+        for pattern in &mut huffman_patterns {
+            pattern.uses = pattern.score; // Use score as usage frequency
         }
         
-        Ok(PatternDict { patterns })
+        // Build Huffman tree for patterns (assigns Huffman codes and depths)
+        if !huffman_patterns.is_empty() {
+            self.assign_pattern_huffman_codes(&mut huffman_patterns)?;
+            
+            // Copy back the Huffman codes and depths to the main patterns
+            for (i, huffman_pattern) in huffman_patterns.iter().enumerate() {
+                patterns[i].code = huffman_pattern.code;
+                patterns[i].code_bits = huffman_pattern.code_bits;
+                patterns[i].depth = huffman_pattern.depth;
+            }
+        }
+
+        Ok(patterns)
     }
 
-    fn write_compressed_file(&mut self, dict: &PatternDict) -> Result<()> {
+    fn assign_pattern_huffman_codes(&self, patterns: &mut [Pattern]) -> Result<()> {
+        // Build Huffman tree for pattern codes based on pattern scores (frequency)
+        let mut huffman_data: Vec<(u64, u64)> = patterns.iter()
+            .enumerate()
+            .map(|(i, pattern)| (i as u64, pattern.score))
+            .collect();
+
+        // Sort by frequency (score) for Huffman encoding
+        huffman_data.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+
+        // Simple Huffman code assignment (binary tree approach)
+        if huffman_data.len() == 1 {
+            // Special case: single pattern gets 1-bit code  
+            patterns[0].code = 0;
+            patterns[0].code_bits = 1;
+            patterns[0].depth = 1;
+        } else if huffman_data.len() > 1 {
+            // Use simple depth-based encoding like positions
+            let total_patterns = huffman_data.len();
+            let max_depth = (total_patterns as f64).log2().ceil() as u64 + 1;
+            
+            for (rank, &(pattern_idx, _)) in huffman_data.iter().enumerate() {
+                let pattern = &mut patterns[pattern_idx as usize];
+                
+                // Assign depth based on rank (most frequent = shallow)
+                let depth = std::cmp::min((rank / 2) as u64 + 1, max_depth);
+                pattern.depth = depth as usize;
+                
+                // Generate binary code for this depth
+                let code_bits = depth as usize;
+                let huffman_code = rank as u64 % (1u64 << code_bits);
+                
+                pattern.code = huffman_code;
+                pattern.code_bits = code_bits;
+                
+                if pattern_idx < 5 {
+                    println!("  Pattern {}: depth={}, code={:b} (bits={}), score={}", 
+                             pattern_idx, depth, huffman_code, code_bits, patterns[pattern_idx as usize].score);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_compressed_file(&mut self, patterns: &[Pattern]) -> Result<()> {
         let mut file = BufWriter::new(File::create(&self.tmp_out_file_path)?);
         
         // Header: 24 bytes
@@ -475,12 +557,12 @@ impl Compressor {
         file.write_all(&self.empty_words_count.to_be_bytes())?;
         
         // Write pattern dictionary
-        let dict_data = self.encode_pattern_dict(dict)?;
+        let dict_data = self.encode_pattern_dict(patterns)?;
         file.write_all(&(dict_data.len() as u64).to_be_bytes())?;
         file.write_all(&dict_data)?;
         
         // Write position dictionary
-        let pos_dict_data = self.encode_pos_dict(dict)?;
+        let pos_dict_data = self.encode_pos_dict(patterns)?;
         file.write_all(&(pos_dict_data.len() as u64).to_be_bytes())?;
         file.write_all(&pos_dict_data)?;
         
@@ -488,40 +570,57 @@ impl Compressor {
         let pos_dict = self.build_pos_lookup()?;
         
         // Write compressed words
-        self.write_compressed_words(&mut file, dict, &pos_dict)?;
+        self.write_compressed_words(&mut file, patterns, &pos_dict)?;
         
         file.flush()?;
         Ok(())
     }
 
-    fn encode_pattern_dict(&self, dict: &PatternDict) -> Result<Vec<u8>> {
+    fn encode_pattern_dict(&self, patterns: &[Pattern]) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         
-        println!("Encoding pattern dictionary with {} patterns", dict.patterns.len());
+        println!("Encoding pattern dictionary with {} patterns", patterns.len());
         
-        // Write each pattern as: varint(depth), varint(len), pattern_bytes
-        for (i, pattern) in dict.patterns.iter().enumerate() {
-            if i < 5 {
-                println!("  Pattern {}: depth={}, len={}, data={:?}", 
-                         i, pattern.depth, pattern.data.len(), 
-                         String::from_utf8_lossy(&pattern.data));
+        // CRITICAL: Patterns must be written in the SAME ORDER that the decompressor will use
+        // to rebuild the Huffman tree. In Go, this is the patternList order (sorted by frequency).
+        // The decompressor builds its Huffman tree from the patterns in file order.
+        
+        // First, we need to sort patterns by their Huffman tree order (by uses/frequency)
+        let mut sorted_patterns = patterns.to_vec();
+        sorted_patterns.sort_by(|a, b| {
+            // Sort by uses (frequency) ascending, with code as tiebreaker
+            // This matches Go's patternListCmp
+            if a.uses == b.uses {
+                // Use stable code as tiebreaker (reversed like Go does)
+                b.code.cmp(&a.code)
+            } else {
+                a.uses.cmp(&b.uses)
             }
-            write_varint_to_vec(&mut data, pattern.depth)?;
-            write_varint_to_vec(&mut data, pattern.data.len() as u64)?;
-            data.extend_from_slice(&pattern.data);
+        });
+        
+        // Write patterns in Huffman tree order
+        for (i, pattern) in sorted_patterns.iter().enumerate() {
+            if i < 5 {
+                println!("  Writing pattern {} in file: stable_code={}, depth={}, uses={}, data={:?}", 
+                         i, pattern.code, pattern.depth, pattern.uses,
+                         String::from_utf8_lossy(&pattern.word));
+            }
+            write_varint_to_vec(&mut data, pattern.depth as u64)?;
+            write_varint_to_vec(&mut data, pattern.word.len() as u64)?;
+            data.extend_from_slice(&pattern.word);
         }
         
         println!("Pattern dictionary encoded: {} bytes", data.len());
         Ok(data)
     }
 
-    fn encode_pos_dict(&self, _dict: &PatternDict) -> Result<Vec<u8>> {
+    fn encode_pos_dict(&self, _patterns: &[Pattern]) -> Result<Vec<u8>> {
         if self.position_counts.is_empty() {
             return Ok(Vec::new());
         }
         
         // Build Huffman tree for positions
-        let positions: Vec<Position> = self.position_counts.iter()
+        let mut positions: Vec<Position> = self.position_counts.iter()
             .map(|(&pos, &uses)| Position {
                 pos,
                 uses,
@@ -530,6 +629,9 @@ impl Compressor {
                 depth: 0,
             })
             .collect();
+        
+        // Sort positions to ensure deterministic order
+        positions.sort_by_key(|p| p.pos);
         
         // Build Huffman tree
         let mut heap = BinaryHeap::new();
@@ -631,30 +733,36 @@ impl Compressor {
 
 
     // Cover a word with patterns - port of Go's coverWordByPatterns logic
-    fn cover_word_with_patterns(&self, word: &[u8], dict: &PatternDict) -> Vec<PatternMatch> {
+    fn cover_word_with_patterns(&self, word: &[u8], patterns: &[Pattern]) -> Vec<PatternMatch> {
         let mut matches = Vec::new();
         
-        if dict.patterns.is_empty() || word.is_empty() {
+        if patterns.is_empty() || word.is_empty() {
             return matches;
         }
         
+        let word_str = String::from_utf8_lossy(word);
+        println!("    Checking word '{}' against {} patterns", word_str, patterns.len());
+        
         // Simple pattern matching - find all occurrences of each pattern
-        for (pattern_id, pattern_data) in dict.patterns.iter().enumerate() {
-            if pattern_data.data.is_empty() {
+        for (pattern_id, pattern_data) in patterns.iter().enumerate() {
+            if pattern_data.word.is_empty() {
                 continue;
             }
             
+            let pattern_str = String::from_utf8_lossy(&pattern_data.word);
+            
             // Find all occurrences of this pattern in the word
             let mut pos = 0;
-            while pos + pattern_data.data.len() <= word.len() {
-                if &word[pos..pos + pattern_data.data.len()] == &pattern_data.data {
+            while pos + pattern_data.word.len() <= word.len() {
+                if &word[pos..pos + pattern_data.word.len()] == &pattern_data.word {
+                    println!("      MATCH: pattern {} ('{}') matches at pos {}", pattern_id, pattern_str, pos);
                     matches.push(PatternMatch {
                         position: pos,
                         pattern_id,
-                        length: pattern_data.data.len(),
+                        length: pattern_data.word.len(),
                     });
                     // Skip overlapping matches for now (can be optimized later)
-                    pos += pattern_data.data.len();
+                    pos += pattern_data.word.len();
                 } else {
                     pos += 1;
                 }
@@ -678,8 +786,8 @@ impl Compressor {
         filtered_matches
     }
 
-    fn write_compressed_words(&mut self, file: &mut BufWriter<File>, dict: &PatternDict, pos_dict: &HashMap<u64, Position>) -> Result<()> {
-        println!("Writing {} compressed words, dict has {} patterns", self.words_count, dict.patterns.len());
+    fn write_compressed_words(&mut self, file: &mut BufWriter<File>, patterns: &[Pattern], pos_dict: &HashMap<u64, Position>) -> Result<()> {
+        println!("Writing {} compressed words, patterns has {} entries", self.words_count, patterns.len());
         println!("Position dictionary has {} entries", pos_dict.len());
         
         // Re-open uncompressed file for reading
@@ -688,13 +796,30 @@ impl Compressor {
         let mut reader = BufReader::new(uncompressed_file);
         
         if !pos_dict.is_empty() {
-            // Use bit encoding for positions
-            let mut output_buffer = Vec::new();
-            let mut bit_writer = BitWriter::new(&mut output_buffer);
+            // Build pattern Huffman codes once
+            let mut sorted_patterns = patterns.to_vec();
+            sorted_patterns.sort_by(|a, b| {
+                if a.uses == b.uses {
+                    b.code.cmp(&a.code)
+                } else {
+                    a.uses.cmp(&b.uses)
+                }
+            });
             
-            // Process each word and write compressed data
-            let mut all_word_data = Vec::new();
+            self.assign_pattern_huffman_codes(&mut sorted_patterns)?;
             
+            // Map from original pattern index to Huffman code
+            let mut pattern_id_to_huffman = HashMap::new();
+            for sorted_pattern in sorted_patterns.iter() {
+                for (orig_idx, orig_pattern) in patterns.iter().enumerate() {
+                    if orig_pattern.code == sorted_pattern.code {
+                        pattern_id_to_huffman.insert(orig_idx, (sorted_pattern.code, sorted_pattern.code_bits));
+                        break;
+                    }
+                }
+            }
+            
+            // Process each word independently
             for word_idx in 0..self.words_count {
                 let len_encoded = read_varint(&mut reader)?;
                 let _is_compressed = (len_encoded & 1) == 0;
@@ -707,6 +832,10 @@ impl Compressor {
                 
                 println!("Processing word {}: {:?} (len={})", word_idx, String::from_utf8_lossy(&word), len);
                 
+                // Create bit writer for this word
+                let mut bit_buffer = Vec::new();
+                let mut bit_writer = BitWriter::new(&mut bit_buffer);
+                
                 // 1. Write word length + 1 as position
                 let word_len_pos = (len + 1) as u64;
                 if let Some(pos_entry) = pos_dict.get(&word_len_pos) {
@@ -717,81 +846,78 @@ impl Compressor {
                 }
                 
                 // 2. Find pattern matches in this word
-                let pattern_matches = self.cover_word_with_patterns(&word, dict);
+                let pattern_matches = self.cover_word_with_patterns(&word, patterns);
                 println!("  Found {} pattern matches", pattern_matches.len());
                 
-                // 3. Write pattern positions (if any)
-                let mut pattern_data = Vec::new();
-                let mut last_pos = 0u64;
-                
+                // Pre-compute relative positions and ensure they're in the dictionary
+                let mut actual_pattern_matches = Vec::new();
+                let mut temp_last_pos = 0u64;
                 for pattern_match in &pattern_matches {
-                    // Write relative position (Go uses relative positions)
+                    let relative_pos = (pattern_match.position as u64 + 1) - temp_last_pos;
+                    temp_last_pos = pattern_match.position as u64 + 1;
+                    
+                    if pos_dict.contains_key(&relative_pos) {
+                        actual_pattern_matches.push(pattern_match.clone());
+                    } else {
+                        println!("    Skipping pattern {} at pos {} (relative_pos={} not in dictionary)", 
+                                pattern_match.pattern_id, pattern_match.position, relative_pos);
+                    }
+                }
+                
+                // 3. Write interleaved position and pattern codes
+                let mut last_pos = 0u64;
+                let mut covered_positions = vec![false; word.len()];
+                
+                for pattern_match in &actual_pattern_matches {
+                    // Write relative position
                     let relative_pos = (pattern_match.position as u64 + 1) - last_pos;
                     last_pos = pattern_match.position as u64 + 1;
                     
-                    println!("    Pattern {} at pos {}, relative_pos={}", pattern_match.pattern_id, pattern_match.position, relative_pos);
-                    
                     if let Some(pos_entry) = pos_dict.get(&relative_pos) {
-                        println!("      Relative position {} -> code={:b} bits={}", relative_pos, pos_entry.code, pos_entry.code_bits);
+                        println!("    Pattern {} at pos {}, relative_pos={}", pattern_match.pattern_id, pattern_match.position, relative_pos);
+                        println!("      Writing relative position {} -> code={:b} bits={}", relative_pos, pos_entry.code, pos_entry.code_bits);
                         bit_writer.write_bits(pos_entry.code, pos_entry.code_bits)?;
-                    } else {
-                        println!("      Warning: Relative position {} not in dictionary, skipping pattern", relative_pos);
-                        continue;
-                    }
-                    
-                    // Store pattern data to write later
-                    pattern_data.push(pattern_match.pattern_id);
-                }
-                
-                // 4. Write terminator (position 0)
-                if let Some(zero_entry) = pos_dict.get(&0) {
-                    println!("  Terminator 0 -> code={:b} bits={}", zero_entry.code, zero_entry.code_bits);
-                    bit_writer.write_bits(zero_entry.code, zero_entry.code_bits)?;
-                } else {
-                    println!("  Warning: No zero terminator in position dictionary");
-                }
-                
-                // 5. Calculate uncovered bytes
-                let mut uncovered_bytes = Vec::new();
-                let mut covered_positions = vec![false; word.len()];
-                
-                // Mark covered positions
-                for pattern_match in &pattern_matches {
-                    for i in 0..pattern_match.length {
-                        if pattern_match.position + i < covered_positions.len() {
-                            covered_positions[pattern_match.position + i] = true;
+                        
+                        // Write pattern code immediately after position (interleaved)
+                        if let Some(&(huffman_code, code_bits)) = pattern_id_to_huffman.get(&pattern_match.pattern_id) {
+                            println!("      Writing pattern {} -> huffman_code={:b} bits={}", 
+                                     pattern_match.pattern_id, huffman_code, code_bits);
+                            bit_writer.write_bits(huffman_code, code_bits)?;
+                        } else {
+                            return Err(Error::InvalidFormat(format!("Pattern {} not found in mapping", pattern_match.pattern_id)));
+                        }
+                        
+                        // Mark covered positions
+                        for i in 0..pattern_match.length {
+                            if pattern_match.position + i < covered_positions.len() {
+                                covered_positions[pattern_match.position + i] = true;
+                            }
                         }
                     }
                 }
                 
-                // Collect uncovered bytes
+                // 4. Write terminator (position 0)
+                if let Some(zero_entry) = pos_dict.get(&0) {
+                    println!("  Writing terminator 0 -> code={:b} bits={}", zero_entry.code, zero_entry.code_bits);
+                    bit_writer.write_bits(zero_entry.code, zero_entry.code_bits)?;
+                } else {
+                    return Err(Error::InvalidFormat("Terminator position 0 not in dictionary".into()));
+                }
+                
+                // 5. Flush bit stream for this word (aligns to byte boundary)
+                bit_writer.flush()?;
+                file.write_all(&bit_buffer)?;
+                
+                // 6. Write uncovered bytes for this word
+                let mut uncovered_count = 0;
                 for (i, &byte) in word.iter().enumerate() {
                     if i >= covered_positions.len() || !covered_positions[i] {
-                        uncovered_bytes.push(byte);
+                        file.write_all(&[byte])?;
+                        uncovered_count += 1;
                     }
                 }
                 
-                println!("  Uncovered bytes: {} out of {}", uncovered_bytes.len(), word.len());
-                
-                all_word_data.push((pattern_data, uncovered_bytes));
-            }
-            
-            // Flush position bits
-            bit_writer.flush()?;
-            
-            // Write all position bits
-            file.write_all(&output_buffer)?;
-            
-            // Now write pattern codes and uncovered data
-            // TODO: This needs to be Huffman encoded too, but for now write as raw data
-            for (pattern_codes, uncovered_bytes) in all_word_data {
-                // Write pattern codes (this should be Huffman encoded in the real implementation)
-                for pattern_id in pattern_codes {
-                    file.write_all(&[pattern_id as u8])?; // Simplified - should be Huffman encoded
-                }
-                
-                // Write uncovered bytes
-                file.write_all(&uncovered_bytes)?;
+                println!("  Uncovered bytes: {} out of {}", uncovered_count, word.len());
             }
             
         } else {
@@ -820,6 +946,65 @@ impl Compressor {
     fn write_position_bits(&self, writer: &mut impl Write, pos: u64) -> Result<()> {
         // When there's no position dictionary, positions are written as varints
         write_varint(writer, pos)?;
+        Ok(())
+    }
+
+    fn rebuild_huffman_codes(&self, patterns: &mut [Pattern]) -> Result<()> {
+        println!("Rebuilding Huffman codes with actual usage statistics...");
+        
+        // Print usage statistics
+        for (i, pattern) in patterns.iter().enumerate().take(5) {
+            println!("  Pattern {}: uses={}, data={:?}", i, pattern.uses, String::from_utf8_lossy(&pattern.word));
+        }
+        
+        // Build proper Huffman codes based on actual usage
+        if !patterns.is_empty() {
+            self.assign_pattern_huffman_codes(patterns)?;
+        }
+        
+        Ok(())
+    }
+    
+    fn collect_pattern_positions(&mut self, patterns: &mut [Pattern]) -> Result<()> {
+        println!("Collecting pattern positions and usage for dictionary building...");
+        
+        // Re-open uncompressed file for reading to collect positions
+        self.uncompressed_file.flush()?;
+        let uncompressed_file = File::open(&self.uncompressed_file.file_path)?;
+        let mut reader = BufReader::new(uncompressed_file);
+        
+        for word_idx in 0..self.words_count {
+            let len_encoded = read_varint(&mut reader)?;
+            let _is_compressed = (len_encoded & 1) == 0;
+            let len = (len_encoded >> 1) as usize;
+            
+            let mut word = vec![0u8; len];
+            if len > 0 {
+                reader.read_exact(&mut word)?;
+            }
+            
+            // Find pattern matches for this word
+            let pattern_matches = self.cover_word_with_patterns(&word, patterns);
+            
+            // Track pattern usage
+            for pattern_match in &pattern_matches {
+                if pattern_match.pattern_id < patterns.len() {
+                    patterns[pattern_match.pattern_id].uses += 1;
+                }
+            }
+            
+            // Track relative positions that would be used
+            let mut last_pos = 0u64;
+            for pattern_match in &pattern_matches {
+                let relative_pos = (pattern_match.position as u64 + 1) - last_pos;
+                last_pos = pattern_match.position as u64 + 1;
+                
+                // Add this relative position to the position counts
+                *self.position_counts.entry(relative_pos).or_insert(0) += 1;
+            }
+        }
+        
+        println!("Collected positions: {:?}", self.position_counts.keys().collect::<Vec<_>>());
         Ok(())
     }
 
