@@ -567,18 +567,11 @@ impl<'a> Getter<'a> {
         Ok((word, end_pos as u64))
     }
 
-    pub fn next(&mut self, buf: &mut Vec<u8>) -> Result<Vec<u8>> {
-        println!("    Starting next() at data_p={}, data_bit={}", 
-                 self.data_p, self.data_bit);
-        if self.data_p < self.data.len() as u64 {
-            println!("      Byte at data_p: 0x{:02x} = 0b{:08b}", self.data[self.data_p as usize], self.data[self.data_p as usize]);
-        }
-        
-        let word_len = self.next_pos(true)?;
-        println!("    Raw word_len from position: {}", word_len);
-        // Position 0 is valid - it represents empty words. Subtract 1 to get actual word length.
-        let word_len = if word_len > 0 { word_len - 1 } else { 0 };
-        println!("    Adjusted word length: {}", word_len);
+    pub fn next(&mut self, _buf: &mut Vec<u8>) -> Result<Vec<u8>> {
+        // Direct port of Go's Next() - decompress.go lines 669-733
+        let save_pos = self.data_p;
+        let mut word_len = self.next_pos(true)?;
+        word_len = if word_len > 0 { word_len - 1 } else { 0 }; // because when create huffman tree we do ++, because 0 is terminator
         
         if word_len == 0 {
             // Handle empty word case - still need to read terminator but no data
