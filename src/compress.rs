@@ -531,10 +531,18 @@ pub struct RawWordsFile {
 impl RawWordsFile {
     pub fn new(file_path: String) -> std::result::Result<Self, CompressionError> {
         // Go: compress.go:833-841
-        let f = File::create(&file_path).map_err(|e| CompressionError::FileCreate {
-            path: file_path.clone(),
-            source: e,
-        })?;
+        // Open with read-write permissions so we can read back later
+        use std::fs::OpenOptions;
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&file_path)
+            .map_err(|e| CompressionError::FileCreate {
+                path: file_path.clone(),
+                source: e,
+            })?;
         let w = BufWriter::new(f.try_clone()?);
 
         Ok(RawWordsFile {
@@ -601,6 +609,7 @@ impl RawWordsFile {
 
         // Seek to beginning
         self.f.seek(std::io::SeekFrom::Start(0))?;
+        log::debug!("RawWordsFile::for_each - starting at position 0, count: {}", self.count);
 
         let mut reader = BufReader::new(&self.f);
         let mut buf = vec![0u8; 16 * 1024];
@@ -611,8 +620,8 @@ impl RawWordsFile {
             let mut shift = 0;
             loop {
                 let mut byte = [0u8; 1];
-                if reader.read_exact(&mut byte).is_err() {
-                    // EOF
+                if let Err(e) = reader.read_exact(&mut byte) {
+                    log::debug!("RawWordsFile::for_each - EOF or error reading varint: {:?}", e);
                     return Ok(());
                 }
                 l |= ((byte[0] & 0x7F) as u64) << shift;
@@ -631,7 +640,8 @@ impl RawWordsFile {
                 buf.resize(l as usize, 0);
             }
             reader.read_exact(&mut buf[..l as usize])?;
-
+            
+            log::debug!("RawWordsFile::for_each - read word of length {}, compressed: {}", l, compressed);
             walker(&buf[..l as usize], compressed)?;
         }
     }

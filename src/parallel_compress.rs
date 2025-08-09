@@ -615,13 +615,20 @@ pub fn compress_with_pattern_candidates(
 
     let mut input_size = 0u64;
     let mut output_size = 0u64;
-    let mut out_count = 0u64;
+    let mut in_count = 0u64;
+    let mut empty_words_count = 0u64;
     let total_words = uncompressed_file.count;
+    
+    log::debug!("[{}] Starting to process {} words from uncompressed file", log_prefix, total_words);
 
     // Go: parallel_compress.go:309-410
     // Process each word
     uncompressed_file.for_each(|v, compression| {
-        out_count += 1;
+        log::debug!("Processing word, len: {}, compressed: {}", v.len(), compression);
+        in_count += 1;
+        if v.is_empty() {
+            empty_words_count += 1;
+        }
         let word_len = v.len() as u64;
 
         // Write length prefix
@@ -659,11 +666,11 @@ pub fn compress_with_pattern_candidates(
         *uncomp_pos_map.entry(0).or_insert(0) += 1;
 
         // Progress logging
-        if out_count % 100000 == 0 {
+        if in_count % 100000 == 0 {
             log::trace!(
                 "[{}] Compression preprocessing: {:.2}%",
                 log_prefix,
-                100.0 * out_count as f64 / total_words as f64
+                100.0 * in_count as f64 / total_words as f64
             );
         }
 
@@ -675,9 +682,10 @@ pub fn compress_with_pattern_candidates(
     drop(intermediate_w);
 
     log::debug!(
-        "[{}] Intermediate file written, processing {} words",
+        "[{}] Intermediate file written, processing {} words, {} empty",
         log_prefix,
-        out_count
+        in_count,
+        empty_words_count
     );
 
     // Go: parallel_compress.go:453-730
@@ -704,8 +712,16 @@ pub fn compress_with_pattern_candidates(
             depth: 0,
         });
     }
+    log::debug!("Building position huffman codes for {} positions", positions.len());
+    for p in &positions {
+        log::debug!("  Position {} with {} uses", p.pos, p.uses);
+    }
     let mut position_huff = PositionHuffBuilder::new(positions);
     position_huff.build_huffman_codes();
+    log::debug!("After huffman building:");
+    for p in &position_huff.positions {
+        log::debug!("  Position {}: depth={}, code={}, bits={}", p.pos, p.depth, p.code, p.code_bits);
+    }
 
     // Write final compressed file
     write_compressed_file(
@@ -713,6 +729,8 @@ pub fn compress_with_pattern_candidates(
         &intermediate_path,
         &pattern_huff.patterns,
         &position_huff.positions,
+        in_count,
+        empty_words_count,
     )?;
 
     // Clean up intermediate file
@@ -833,52 +851,18 @@ fn write_compressed_file(
     intermediate_path: &str,
     patterns: &[Pattern],
     positions: &[Position],
+    word_count: u64,
+    empty_words_count: u64,
 ) -> std::result::Result<(), CompressionError> {
     use std::collections::HashMap;
     use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
     let mut w = BufWriter::new(cf);
-
-    // First pass: count words and collect statistics
     let mut intermediate = std::fs::File::open(intermediate_path)?;
-    let mut word_count = 0u64;
-    let mut empty_word_count = 0u64;
 
-    loop {
-        let mut len_buf = [0u8; 10];
-        let mut bytes_read = 0;
-
-        // Try to read varint length
-        while bytes_read < len_buf.len() {
-            let n = intermediate.read(&mut len_buf[bytes_read..bytes_read + 1])?;
-            if n == 0 {
-                break;
-            }
-            bytes_read += 1;
-            if len_buf[bytes_read - 1] & 0x80 == 0 {
-                break;
-            }
-        }
-
-        if bytes_read == 0 {
-            break; // EOF
-        }
-
-        let (word_len, _) = decode_varint(&len_buf[..bytes_read])?;
-        word_count += 1;
-
-        if word_len == 0 {
-            empty_word_count += 1;
-        } else {
-            // Skip the word data
-            let mut skip_buf = vec![0u8; word_len as usize];
-            intermediate.read_exact(&mut skip_buf)?;
-        }
-    }
-
-    // Write header
-    w.write_all(&word_count.to_be_bytes())?;
-    w.write_all(&empty_word_count.to_be_bytes())?;
+    // Write header (Go: parallel_compress.go:535-543)
+    w.write_all(&word_count.to_be_bytes())?;      // Words count
+    w.write_all(&empty_words_count.to_be_bytes())?; // Empty words count
 
     // Write pattern dictionary
     let mut pattern_dict_data = Vec::new();
@@ -918,12 +902,15 @@ fn write_compressed_file(
     for position in positions {
         pos2code.insert(position.pos, position);
     }
+    
+    log::debug!("Position map has {} entries, contains 0: {}", pos2code.len(), pos2code.contains_key(&0));
 
     // Second pass: re-encode with Huffman codes
     intermediate.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(intermediate);
     let mut bit_writer = BitWriter::new(&mut w);
 
+    let mut words_written = 0u64;
     loop {
         // Read word length
         let mut len_buf = [0u8; 10];
@@ -958,6 +945,8 @@ fn write_compressed_file(
         if word_len == 0 {
             // Empty word
             bit_writer.flush()?;
+            words_written += 1;
+            log::trace!("Wrote empty word, total: {}", words_written);
             continue; // Move to next word
         }
 
@@ -980,8 +969,16 @@ fn write_compressed_file(
 
         if pattern_count == 0 {
             // No patterns - word is uncompressed
+            // Write terminating position code (Go: parallel_compress.go:705-708)
+            if let Some(pos_code) = pos2code.get(&0) {
+                bit_writer.encode(pos_code.code, pos_code.code_bits)?;
+            }
+            bit_writer.flush()?;
+            
+            // Copy uncovered bytes (the entire word)
             let mut word_data = vec![0u8; word_len as usize];
             reader.read_exact(&mut word_data)?;
+            log::debug!("Writing {} uncovered bytes for word with no patterns", word_len);
             bit_writer.write_bytes(&word_data)?;
         } else {
             // Process patterns
@@ -1060,7 +1057,12 @@ fn write_compressed_file(
                 bit_writer.write_bytes(&uncovered_data)?;
             }
         }
+        
+        words_written += 1;
+        log::trace!("Wrote word {}, length: {}", words_written, word_len);
     }
+    
+    log::debug!("Total words written to compressed file: {}", words_written);
 
     // Finish with BitWriter and get back the underlying writer
     let mut w = bit_writer.into_inner()?;

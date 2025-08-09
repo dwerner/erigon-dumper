@@ -10,6 +10,11 @@ mod tests {
     #[test]
     fn test_compress_empty_dict() {
         use crate::decompress::Decompressor;
+        
+        // Initialize logger for debugging
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .try_init();
 
         let tmp_dir = TempDir::new().unwrap();
         let file_path = tmp_dir.path().join("compressed");
@@ -39,6 +44,7 @@ mod tests {
 
         assert!(getter.has_next());
         let (word, _) = getter.next(Vec::new());
+        println!("Got word: {:?}, expected: {:?}", std::str::from_utf8(&word), "word");
         assert_eq!(word, b"word");
         assert!(!getter.has_next());
     }
