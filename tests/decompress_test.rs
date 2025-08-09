@@ -49,7 +49,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
         }
 
         compressor.compress().unwrap();
-        compressor.close();
+        drop(compressor); // Close by dropping
 
         let decompressor = Decompressor::new(&file_path).unwrap();
         (tmp_dir, decompressor)
@@ -171,7 +171,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
         }
 
         compressor.compress().unwrap();
-        compressor.close();
+        drop(compressor); // Close by dropping
 
         let decompressor = Decompressor::new(&file_path).unwrap();
         (tmp_dir, decompressor)
@@ -224,7 +224,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
 
         // Compress with no words added
         compressor.compress().unwrap();
-        compressor.close();
+        drop(compressor); // Close by dropping
 
         // Should be able to open empty compressed file
         let decompressor = Decompressor::new(&file_path).unwrap();
@@ -257,7 +257,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
         let test_word = b"hello world";
         compressor.add_word(test_word).unwrap();
         compressor.compress().unwrap();
-        compressor.close();
+        drop(compressor); // Close by dropping
 
         let decompressor = Decompressor::new(&file_path).unwrap();
         let mut getter = decompressor.make_getter();
@@ -303,7 +303,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
         }
 
         compressor.compress().unwrap();
-        compressor.close();
+        drop(compressor); // Close by dropping
 
         let decompressor = Decompressor::new(&file_path).unwrap();
         let mut getter = decompressor.make_getter();
@@ -344,7 +344,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
         compressor.add_word(b"third").unwrap();
 
         compressor.compress().unwrap();
-        compressor.close();
+        drop(compressor); // Close by dropping
 
         let decompressor = Decompressor::new(&file_path).unwrap();
         let mut getter = decompressor.make_getter();

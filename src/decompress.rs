@@ -11,7 +11,7 @@ use std::time::SystemTime;
 type Word = Vec<u8>; // plain text word associated with code from dictionary
 
 // From Go: decompress.go:41
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Codeword {
     pattern: Word,             // Pattern corresponding to entries
     ptr: Option<Box<PatternTable>>, // pointer to deeper level tables
@@ -36,7 +36,7 @@ impl PatternTable {
         };
         
         PatternTable {
-            patterns: vec![None; size],
+            patterns: (0..size).map(|_| None).collect(),
             bit_len,
         }
     }
@@ -54,7 +54,14 @@ impl PatternTable {
             
             let mut c = code_from;
             while c < code_to {
-                self.patterns[c as usize] = Some(cw.clone());
+                // Store reference to the same codeword
+                let stored_cw = Codeword {
+                    pattern: cw.pattern.clone(),
+                    ptr: None, // ptr is always None for simple codewords
+                    code: cw.code,
+                    len: cw.len,
+                };
+                self.patterns[c as usize] = Some(stored_cw);
                 c += code_step;
             }
         } else {
@@ -103,7 +110,7 @@ impl PosTable {
         PosTable {
             pos: vec![0; size],
             lens: vec![0; size],
-            ptrs: vec![None; size],
+            ptrs: (0..size).map(|_| None).collect(),
             bit_len,
         }
     }
@@ -600,7 +607,7 @@ fn parse_dictionary(data: &[u8]) -> Result<(PatternTable, PosTable, usize, u64),
     }
     
     // Build pattern table from huffman data
-    let mut dict = build_pattern_table(&pattern_huffs)?;
+    let dict = build_pattern_table(&pattern_huffs)?;
     
     // Read positions dictionary
     // Go: decompress.go:370-440
@@ -740,7 +747,7 @@ mod tests {
             code: 5,
             len: 3,
         };
-        table.insert_word(cw.clone());
+        table.insert_word(cw);
         
         assert!(table.condensed_table_search(5).is_some());
     }

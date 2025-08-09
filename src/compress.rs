@@ -311,6 +311,12 @@ impl Compressor {
             self.superstring.push(0x00);
         }
 
+        // Also write to uncompressed file like Go does
+        // Go: compress.go:221
+        if let Some(ref mut file) = self.uncompressed_file {
+            file.append(word)?;
+        }
+
         Ok(())
     }
 
@@ -370,7 +376,7 @@ impl Compressor {
 
         // Build dictionary from collected superstrings
         // Go: compress.go:251
-        let mut dict_builder = self.build_dictionary()?;
+        let dict_builder = self.build_dictionary()?;
 
         // Save dictionary for debugging if trace is enabled
         // Go: compress.go:255-260

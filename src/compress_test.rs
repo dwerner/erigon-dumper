@@ -8,8 +8,9 @@ mod tests {
 
     // Go test: TestCompressEmptyDict
     #[test]
-    #[ignore] // Ignore until we implement the compress/decompress methods
     fn test_compress_empty_dict() {
+        use crate::decompress::Decompressor;
+
         let tmp_dir = TempDir::new().unwrap();
         let file_path = tmp_dir.path().join("compressed");
 
@@ -28,17 +29,18 @@ mod tests {
         // Now we can test AddWord
         compressor.add_word(b"word").unwrap();
 
-        // TODO: Implement Compress
-        // compressor.compress().unwrap();
+        // Compress the data
+        compressor.compress().unwrap();
+        drop(compressor); // Close by dropping
 
-        // TODO: Implement Decompressor
-        // let decompressor = Decompressor::new(&file_path).unwrap();
-        // let mut getter = decompressor.make_getter();
+        // Test decompression
+        let decompressor = Decompressor::new(&file_path).unwrap();
+        let mut getter = decompressor.make_getter();
 
-        // assert!(getter.has_next());
-        // let word = getter.next(None).unwrap();
-        // assert_eq!(word, b"word");
-        // assert!(!getter.has_next());
+        assert!(getter.has_next());
+        let (word, _) = getter.next(Vec::new());
+        assert_eq!(word, b"word");
+        assert!(!getter.has_next());
     }
 
     // Go test: prepareDict helper
@@ -83,8 +85,9 @@ mod tests {
 
     // Go test: TestCompressDict1
     #[test]
-    #[ignore] // Ignore until we implement the compress/decompress methods
     fn test_compress_dict1() {
+        use crate::decompress::Decompressor;
+
         let tmp_dir = TempDir::new().unwrap();
         let file_path = tmp_dir.path().join("compressed");
 
@@ -103,22 +106,23 @@ mod tests {
 
         let words = prepare_dict();
 
-        // TODO: Implement AddWord and Compress
-        // for word in &words {
-        //     compressor.add_word(word).unwrap();
-        // }
-        // compressor.compress().unwrap();
+        // Add all words to compressor
+        for word in &words {
+            compressor.add_word(word).unwrap();
+        }
+        compressor.compress().unwrap();
+        drop(compressor); // Close by dropping
 
-        // TODO: Implement Decompressor and verify
-        // let decompressor = Decompressor::new(&file_path).unwrap();
-        // let mut getter = decompressor.make_getter();
+        // Decompress and verify
+        let decompressor = Decompressor::new(&file_path).unwrap();
+        let mut getter = decompressor.make_getter();
 
-        // for expected_word in &words {
-        //     assert!(getter.has_next());
-        //     let word = getter.next(None).unwrap();
-        //     assert_eq!(word, expected_word.as_slice());
-        // }
-        // assert!(!getter.has_next());
+        for expected_word in &words {
+            assert!(getter.has_next());
+            let (word, _) = getter.next(Vec::new());
+            assert_eq!(word, expected_word.as_slice());
+        }
+        assert!(!getter.has_next());
     }
 
     // Test for DictionaryBuilder (not in original Go tests, but useful)
