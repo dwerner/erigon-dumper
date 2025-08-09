@@ -60,10 +60,10 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
     fn test_decompress_skip() {
         let (_tmp_dir, decompressor) = prepare_lorem_dict();
         let mut getter = decompressor.make_getter();
-        
+
         let lorem_strings = get_lorem_strings();
         let mut i = 0;
-        
+
         while getter.has_next() {
             let w = &lorem_strings[i];
             if i % 2 == 0 {
@@ -75,7 +75,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
             }
             i += 1;
         }
-        
+
         // Test reset and offsets
         getter.reset(0);
         let (_, offset) = getter.next(Vec::new());
@@ -89,15 +89,19 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
     fn test_decompress_match_ok() {
         let (_tmp_dir, decompressor) = prepare_lorem_dict();
         let mut getter = decompressor.make_getter();
-        
+
         let lorem_strings = get_lorem_strings();
         let mut i = 0;
-        
+
         while getter.has_next() {
             let w = &lorem_strings[i];
             if i % 2 != 0 {
                 let expected = format!("{} {}", String::from_utf8_lossy(w), i);
-                assert!(getter.match_prefix(expected.as_bytes()), "expected match with {}", expected);
+                assert!(
+                    getter.match_prefix(expected.as_bytes()),
+                    "expected match with {}",
+                    expected
+                );
                 getter.skip();
             } else {
                 let (word, _) = getter.next(Vec::new());
@@ -113,35 +117,38 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
     fn test_decompress_match_prefix() {
         let (_tmp_dir, decompressor) = prepare_lorem_dict();
         let mut getter = decompressor.make_getter();
-        
+
         let lorem_strings = get_lorem_strings();
         let mut i = 0;
-        
+
         // Test matching correct prefixes
         while getter.has_next() {
             let w = &lorem_strings[i];
             let full_word = format!("{} {}", String::from_utf8_lossy(w), i + 1);
             let expected = &full_word.as_bytes()[..full_word.len() / 2];
-            
+
             assert!(getter.match_prefix(expected), "expected match with prefix");
             getter.skip();
             i += 1;
         }
-        
+
         // Reset and test non-matching prefixes
         getter.reset(0);
         i = 0;
-        
+
         while getter.has_next() {
             let w = &lorem_strings[i];
             let full_word = format!("{} {}", String::from_utf8_lossy(w), i + 1);
             let mut wrong_prefix = full_word.as_bytes()[..full_word.len() / 2].to_vec();
-            
+
             if !wrong_prefix.is_empty() {
                 wrong_prefix[wrong_prefix.len() - 1] += 1;
-                assert!(!getter.match_prefix(&wrong_prefix), "not expected match with wrong prefix");
+                assert!(
+                    !getter.match_prefix(&wrong_prefix),
+                    "not expected match with wrong prefix"
+                );
             }
-            
+
             getter.skip();
             i += 1;
         }
@@ -182,16 +189,16 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
     fn test_decompress_match_not_ok() {
         let (_tmp_dir, decompressor) = prepare_lorem_dict();
         let mut getter = decompressor.make_getter();
-        
+
         let lorem_strings = get_lorem_strings();
         let mut i = 0;
         let mut skip_count = 0;
-        
+
         while getter.has_next() {
             let w = &lorem_strings[i];
             // Test with wrong index (i+1 instead of i)
             let wrong_word = format!("{} {}", String::from_utf8_lossy(w), i + 1);
-            
+
             // Should not match the wrong word
             if !getter.match_prefix(wrong_word.as_bytes()) {
                 getter.skip();
@@ -199,7 +206,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
             }
             i += 1;
         }
-        
+
         // All words should have been skipped due to mismatch
         assert!(skip_count > 0);
     }
@@ -229,7 +236,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
         // Should be able to open empty compressed file
         let decompressor = Decompressor::new(&file_path).unwrap();
         let mut getter = decompressor.make_getter();
-        
+
         // Should have no words
         assert!(!getter.has_next());
         assert_eq!(decompressor.count(), 0);
@@ -261,7 +268,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
 
         let decompressor = Decompressor::new(&file_path).unwrap();
         let mut getter = decompressor.make_getter();
-        
+
         assert!(getter.has_next());
         let (word, _) = getter.next(Vec::new());
         assert_eq!(word, test_word);
@@ -307,7 +314,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
 
         let decompressor = Decompressor::new(&file_path).unwrap();
         let mut getter = decompressor.make_getter();
-        
+
         // Verify all words are decompressed correctly
         for expected_word in &words {
             assert!(getter.has_next());
@@ -348,7 +355,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
 
         let decompressor = Decompressor::new(&file_path).unwrap();
         let mut getter = decompressor.make_getter();
-        
+
         let expected = vec![
             b"first".to_vec(),
             b"".to_vec(),
@@ -372,9 +379,9 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
     fn test_getter_reset() {
         let (_tmp_dir, decompressor) = prepare_lorem_dict();
         let mut getter = decompressor.make_getter();
-        
+
         let lorem_strings = get_lorem_strings();
-        
+
         // Read first few words
         let mut first_words = Vec::new();
         for i in 0..5 {
@@ -382,10 +389,10 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
             let (word, _) = getter.next(Vec::new());
             first_words.push(word);
         }
-        
+
         // Reset to beginning
         getter.reset(0);
-        
+
         // Should read the same words again
         for (i, expected) in first_words.iter().enumerate() {
             assert!(getter.has_next());
@@ -399,7 +406,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
     fn test_match_empty_prefix() {
         let (_tmp_dir, decompressor) = prepare_lorem_dict();
         let mut getter = decompressor.make_getter();
-        
+
         while getter.has_next() {
             // Empty prefix should always match
             assert!(getter.match_prefix(b""));

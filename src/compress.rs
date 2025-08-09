@@ -389,10 +389,11 @@ impl Compressor {
 
         // Create compressed file
         // Go: compress.go:263-267
-        let cf = File::create(&self.tmp_out_file_path).map_err(|e| CompressionError::FileCreate {
-            path: self.tmp_out_file_path.clone(),
-            source: e,
-        })?;
+        let cf =
+            File::create(&self.tmp_out_file_path).map_err(|e| CompressionError::FileCreate {
+                path: self.tmp_out_file_path.clone(),
+                source: e,
+            })?;
 
         // Compress with pattern candidates
         // Go: compress.go:269-271
@@ -448,26 +449,26 @@ impl Compressor {
     fn build_dictionary(&mut self) -> std::result::Result<DictionaryBuilder, CompressionError> {
         // Go: parallel_compress.go:916-947
         // This is a simplified version without ETL collectors
-        
+
         let mut dict_builder = DictionaryBuilder::new(self.cfg.dict_reducer_soft_limit);
-        
+
         // Extract patterns from all superstrings
         let patterns = crate::parallel_compress::extract_patterns_in_superstrings(
             self.superstrings.clone(),
             &self.cfg,
         );
-        
+
         // Add patterns to dictionary builder
         for pattern in patterns {
             dict_builder.process_word(pattern.word, pattern.score);
         }
-        
+
         // Finish with hard limit
         dict_builder.finish(self.cfg.max_dict_patterns);
-        
+
         // Sort patterns
         dict_builder.sort();
-        
+
         Ok(dict_builder)
     }
 }
@@ -597,13 +598,13 @@ impl RawWordsFile {
         F: FnMut(&[u8], bool) -> std::result::Result<(), CompressionError>,
     {
         use std::io::{BufReader, Read, Seek};
-        
+
         // Seek to beginning
         self.f.seek(std::io::SeekFrom::Start(0))?;
-        
+
         let mut reader = BufReader::new(&self.f);
         let mut buf = vec![0u8; 16 * 1024];
-        
+
         loop {
             // Read varint length
             let mut l = 0u64;
@@ -620,17 +621,17 @@ impl RawWordsFile {
                 }
                 shift += 7;
             }
-            
+
             // Extract lowest bit as "uncompressed" flag
             let compressed = (l & 1) == 0;
             l >>= 1;
-            
+
             // Read word bytes
             if buf.len() < l as usize {
                 buf.resize(l as usize, 0);
             }
             reader.read_exact(&mut buf[..l as usize])?;
-            
+
             walker(&buf[..l as usize], compressed)?;
         }
     }
@@ -660,22 +661,128 @@ pub struct Position {
 
 // From Go: PatternHuff struct (for Huffman tree)
 pub struct PatternHuff {
-    p0: Option<Box<Pattern>>,
-    p1: Option<Box<Pattern>>,
-    h0: Option<Box<PatternHuff>>,
-    h1: Option<Box<PatternHuff>>,
-    uses: u64,
-    tie_breaker: u64,
+    pub p0: Option<Box<Pattern>>,
+    pub p1: Option<Box<Pattern>>,
+    pub h0: Option<Box<PatternHuff>>,
+    pub h1: Option<Box<PatternHuff>>,
+    pub uses: u64,
+    pub tie_breaker: u64,
+}
+
+impl PatternHuff {
+    pub fn add_zero(&mut self) {
+        if let Some(ref mut p0) = self.p0 {
+            p0.code <<= 1;
+            p0.code_bits += 1;
+        } else if let Some(ref mut h0) = self.h0 {
+            h0.add_zero();
+        }
+
+        if let Some(ref mut p1) = self.p1 {
+            p1.code <<= 1;
+            p1.code_bits += 1;
+        } else if let Some(ref mut h1) = self.h1 {
+            h1.add_zero();
+        }
+    }
+
+    pub fn add_one(&mut self) {
+        if let Some(ref mut p0) = self.p0 {
+            p0.code <<= 1;
+            p0.code |= 1;
+            p0.code_bits += 1;
+        } else if let Some(ref mut h0) = self.h0 {
+            h0.add_one();
+        }
+
+        if let Some(ref mut p1) = self.p1 {
+            p1.code <<= 1;
+            p1.code |= 1;
+            p1.code_bits += 1;
+        } else if let Some(ref mut h1) = self.h1 {
+            h1.add_one();
+        }
+    }
+
+    pub fn set_depth(&mut self, depth: usize) {
+        if let Some(ref mut p0) = self.p0 {
+            p0.depth = depth + 1;
+            p0.uses = 0;
+        }
+        if let Some(ref mut p1) = self.p1 {
+            p1.depth = depth + 1;
+            p1.uses = 0;
+        }
+        if let Some(ref mut h0) = self.h0 {
+            h0.set_depth(depth + 1);
+        }
+        if let Some(ref mut h1) = self.h1 {
+            h1.set_depth(depth + 1);
+        }
+    }
 }
 
 // From Go: PositionHuff struct (for Huffman tree)
 pub struct PositionHuff {
-    p0: Option<Box<Position>>,
-    p1: Option<Box<Position>>,
-    h0: Option<Box<PositionHuff>>,
-    h1: Option<Box<PositionHuff>>,
-    uses: u64,
-    tie_breaker: u64,
+    pub p0: Option<Box<Position>>,
+    pub p1: Option<Box<Position>>,
+    pub h0: Option<Box<PositionHuff>>,
+    pub h1: Option<Box<PositionHuff>>,
+    pub uses: u64,
+    pub tie_breaker: u64,
+}
+
+impl PositionHuff {
+    pub fn add_zero(&mut self) {
+        if let Some(ref mut p0) = self.p0 {
+            p0.code <<= 1;
+            p0.code_bits += 1;
+        } else if let Some(ref mut h0) = self.h0 {
+            h0.add_zero();
+        }
+
+        if let Some(ref mut p1) = self.p1 {
+            p1.code <<= 1;
+            p1.code_bits += 1;
+        } else if let Some(ref mut h1) = self.h1 {
+            h1.add_zero();
+        }
+    }
+
+    pub fn add_one(&mut self) {
+        if let Some(ref mut p0) = self.p0 {
+            p0.code <<= 1;
+            p0.code |= 1;
+            p0.code_bits += 1;
+        } else if let Some(ref mut h0) = self.h0 {
+            h0.add_one();
+        }
+
+        if let Some(ref mut p1) = self.p1 {
+            p1.code <<= 1;
+            p1.code |= 1;
+            p1.code_bits += 1;
+        } else if let Some(ref mut h1) = self.h1 {
+            h1.add_one();
+        }
+    }
+
+    pub fn set_depth(&mut self, depth: usize) {
+        if let Some(ref mut p0) = self.p0 {
+            p0.depth = depth + 1;
+            p0.uses = 0;
+        }
+        if let Some(ref mut p1) = self.p1 {
+            p1.depth = depth + 1;
+            p1.uses = 0;
+        }
+        if let Some(ref mut h0) = self.h0 {
+            h0.set_depth(depth + 1);
+        }
+        if let Some(ref mut h1) = self.h1 {
+            h1.set_depth(depth + 1);
+        }
+    }
 }
 
 // From Go: DynamicCell struct (from compress.go)
@@ -683,7 +790,7 @@ pub struct PositionHuff {
 pub struct DynamicCell {
     pub optim_start: usize,
     pub cover_start: usize,
-    pub compression: i32,  // Changed to i32 to match Go's int type
+    pub compression: i32, // Changed to i32 to match Go's int type
     pub score: u64,
     pub pattern_idx: usize, // offset of the last element in the pattern slice
 }
@@ -846,10 +953,13 @@ impl BitWriter {
 // Helper functions
 
 // From Go: persistDictionary - compress.go
-fn persist_dictionary(path: &std::path::Path, dict: &DictionaryBuilder) -> std::result::Result<(), CompressionError> {
+fn persist_dictionary(
+    path: &std::path::Path,
+    dict: &DictionaryBuilder,
+) -> std::result::Result<(), CompressionError> {
     use std::fs::File;
     use std::io::Write;
-    
+
     let mut file = File::create(path)?;
     dict.for_each(|score, word| {
         writeln!(file, "{}: {:?}", score, String::from_utf8_lossy(word)).ok();
@@ -858,22 +968,29 @@ fn persist_dictionary(path: &std::path::Path, dict: &DictionaryBuilder) -> std::
 }
 
 // From Go: calculateRatio - compress.go
-fn calculate_ratio(uncompressed_path: &str, compressed_path: &str) -> std::result::Result<CompressionRatio, CompressionError> {
+fn calculate_ratio(
+    uncompressed_path: &str,
+    compressed_path: &str,
+) -> std::result::Result<CompressionRatio, CompressionError> {
     use std::fs;
-    
+
     let uncompressed_meta = fs::metadata(uncompressed_path)?;
     let compressed_meta = fs::metadata(compressed_path)?;
-    
+
     let uncompressed_size = uncompressed_meta.len();
     let compressed_size = compressed_meta.len();
-    
-    log::debug!("Uncompressed size: {}, Compressed size: {}", uncompressed_size, compressed_size);
-    
+
+    log::debug!(
+        "Uncompressed size: {}, Compressed size: {}",
+        uncompressed_size,
+        compressed_size
+    );
+
     if compressed_size == 0 {
         // If compressed file is empty, return 0 ratio
         return Ok(0.0);
     }
-    
+
     let ratio = uncompressed_size as f64 / compressed_size as f64;
     Ok(ratio)
 }
