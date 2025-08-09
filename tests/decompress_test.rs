@@ -3,8 +3,8 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::compress::{Cfg, Compressor};
-    use crate::decompress::Decompressor;
+    use erigon_dumper::compress::{Cfg, Compressor};
+    use erigon_dumper::decompress::Decompressor;
     use tempfile::TempDir;
 
     // Lorem ipsum test data
@@ -142,7 +142,8 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
             let mut wrong_prefix = full_word.as_bytes()[..full_word.len() / 2].to_vec();
 
             if !wrong_prefix.is_empty() {
-                wrong_prefix[wrong_prefix.len() - 1] += 1;
+                let last_idx = wrong_prefix.len() - 1;
+                wrong_prefix[last_idx] += 1;
                 assert!(
                     !getter.match_prefix(&wrong_prefix),
                     "not expected match with wrong prefix"

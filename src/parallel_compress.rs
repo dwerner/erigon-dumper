@@ -958,105 +958,106 @@ fn write_compressed_file(
         if word_len == 0 {
             // Empty word
             bit_writer.flush()?;
-        } else {
-            // Read pattern count
-            let mut pattern_count_buf = [0u8; 10];
-            let mut bytes_read = 0;
+            continue; // Move to next word
+        }
 
-            while bytes_read < pattern_count_buf.len() {
-                let n = reader.read(&mut pattern_count_buf[bytes_read..bytes_read + 1])?;
-                if n == 0 {
-                    break;
+        // Read pattern count for non-empty words
+        let mut pattern_count_buf = [0u8; 10];
+        let mut bytes_read = 0;
+
+        while bytes_read < pattern_count_buf.len() {
+            let n = reader.read(&mut pattern_count_buf[bytes_read..bytes_read + 1])?;
+            if n == 0 {
+                break;
+            }
+            bytes_read += 1;
+            if pattern_count_buf[bytes_read - 1] & 0x80 == 0 {
+                break;
+            }
+        }
+
+        let (pattern_count, _) = decode_varint(&pattern_count_buf[..bytes_read])?;
+
+        if pattern_count == 0 {
+            // No patterns - word is uncompressed
+            let mut word_data = vec![0u8; word_len as usize];
+            reader.read_exact(&mut word_data)?;
+            bit_writer.write_bytes(&word_data)?;
+        } else {
+            // Process patterns
+            let mut last_pos = 0u64;
+            let mut uncovered_count = 0usize;
+            let mut last_uncovered = 0usize;
+
+            for _ in 0..pattern_count {
+                // Read pattern position
+                let mut pos_buf = [0u8; 10];
+                let mut bytes_read = 0;
+
+                while bytes_read < pos_buf.len() {
+                    let n = reader.read(&mut pos_buf[bytes_read..bytes_read + 1])?;
+                    if n == 0 {
+                        break;
+                    }
+                    bytes_read += 1;
+                    if pos_buf[bytes_read - 1] & 0x80 == 0 {
+                        break;
+                    }
                 }
-                bytes_read += 1;
-                if pattern_count_buf[bytes_read - 1] & 0x80 == 0 {
-                    break;
+
+                let (pos, _) = decode_varint(&pos_buf[..bytes_read])?;
+
+                // Encode relative position with huffman code
+                if let Some(pos_code) = pos2code.get(&(pos - last_pos + 1)) {
+                    bit_writer.encode(pos_code.code, pos_code.code_bits)?;
+                }
+                last_pos = pos;
+
+                // Read pattern code
+                let mut code_buf = [0u8; 10];
+                let mut bytes_read = 0;
+
+                while bytes_read < code_buf.len() {
+                    let n = reader.read(&mut code_buf[bytes_read..bytes_read + 1])?;
+                    if n == 0 {
+                        break;
+                    }
+                    bytes_read += 1;
+                    if code_buf[bytes_read - 1] & 0x80 == 0 {
+                        break;
+                    }
+                }
+
+                let (pattern_code, _) = decode_varint(&code_buf[..bytes_read])?;
+
+                // Encode pattern with huffman code
+                if let Some(pattern) = code2pattern.get(&pattern_code) {
+                    bit_writer.encode(pattern.code, pattern.code_bits)?;
+
+                    // Track uncovered bytes
+                    if pos as usize > last_uncovered {
+                        uncovered_count += pos as usize - last_uncovered;
+                    }
+                    last_uncovered = pos as usize + pattern.word.len();
                 }
             }
 
-            let (pattern_count, _) = decode_varint(&pattern_count_buf[..bytes_read])?;
+            // Calculate total uncovered bytes
+            if word_len as usize > last_uncovered {
+                uncovered_count += word_len as usize - last_uncovered;
+            }
 
-            if pattern_count == 0 {
-                // No patterns - word is uncompressed
-                let mut word_data = vec![0u8; word_len as usize];
-                reader.read_exact(&mut word_data)?;
-                bit_writer.write_bytes(&word_data)?;
-            } else {
-                // Process patterns
-                let mut last_pos = 0u64;
-                let mut uncovered_count = 0usize;
-                let mut last_uncovered = 0usize;
+            // Write terminating position code
+            if let Some(pos_code) = pos2code.get(&0) {
+                bit_writer.encode(pos_code.code, pos_code.code_bits)?;
+            }
+            bit_writer.flush()?;
 
-                for _ in 0..pattern_count {
-                    // Read pattern position
-                    let mut pos_buf = [0u8; 10];
-                    let mut bytes_read = 0;
-
-                    while bytes_read < pos_buf.len() {
-                        let n = reader.read(&mut pos_buf[bytes_read..bytes_read + 1])?;
-                        if n == 0 {
-                            break;
-                        }
-                        bytes_read += 1;
-                        if pos_buf[bytes_read - 1] & 0x80 == 0 {
-                            break;
-                        }
-                    }
-
-                    let (pos, _) = decode_varint(&pos_buf[..bytes_read])?;
-
-                    // Encode relative position with huffman code
-                    if let Some(pos_code) = pos2code.get(&(pos - last_pos + 1)) {
-                        bit_writer.encode(pos_code.code, pos_code.code_bits)?;
-                    }
-                    last_pos = pos;
-
-                    // Read pattern code
-                    let mut code_buf = [0u8; 10];
-                    let mut bytes_read = 0;
-
-                    while bytes_read < code_buf.len() {
-                        let n = reader.read(&mut code_buf[bytes_read..bytes_read + 1])?;
-                        if n == 0 {
-                            break;
-                        }
-                        bytes_read += 1;
-                        if code_buf[bytes_read - 1] & 0x80 == 0 {
-                            break;
-                        }
-                    }
-
-                    let (pattern_code, _) = decode_varint(&code_buf[..bytes_read])?;
-
-                    // Encode pattern with huffman code
-                    if let Some(pattern) = code2pattern.get(&pattern_code) {
-                        bit_writer.encode(pattern.code, pattern.code_bits)?;
-
-                        // Track uncovered bytes
-                        if pos as usize > last_uncovered {
-                            uncovered_count += pos as usize - last_uncovered;
-                        }
-                        last_uncovered = pos as usize + pattern.word.len();
-                    }
-                }
-
-                // Calculate total uncovered bytes
-                if word_len as usize > last_uncovered {
-                    uncovered_count += word_len as usize - last_uncovered;
-                }
-
-                // Write terminating position code
-                if let Some(pos_code) = pos2code.get(&0) {
-                    bit_writer.encode(pos_code.code, pos_code.code_bits)?;
-                }
-                bit_writer.flush()?;
-
-                // Copy uncovered bytes
-                if uncovered_count > 0 {
-                    let mut uncovered_data = vec![0u8; uncovered_count];
-                    reader.read_exact(&mut uncovered_data)?;
-                    bit_writer.write_bytes(&uncovered_data)?;
-                }
+            // Copy uncovered bytes
+            if uncovered_count > 0 {
+                let mut uncovered_data = vec![0u8; uncovered_count];
+                reader.read_exact(&mut uncovered_data)?;
+                bit_writer.write_bytes(&uncovered_data)?;
             }
         }
     }
