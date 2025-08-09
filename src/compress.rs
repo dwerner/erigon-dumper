@@ -673,11 +673,11 @@ pub struct PositionHuff {
 }
 
 // From Go: DynamicCell struct (from compress.go)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct DynamicCell {
     pub optim_start: usize,
     pub cover_start: usize,
-    pub compression: usize,
+    pub compression: i32,  // Changed to i32 to match Go's int type
     pub score: u64,
     pub pattern_idx: usize, // offset of the last element in the pattern slice
 }
@@ -710,7 +710,83 @@ impl Ring {
         }
     }
 
-    // Will implement PushFront, PushBack, Get methods when needed
+    // From Go: Reset - compress.go:700-704
+    pub fn reset(&mut self) {
+        self.count = 0;
+        self.head = 0;
+        self.tail = 0;
+    }
+
+    // From Go: ensureSize - compress.go:706-720
+    fn ensure_size(&mut self) {
+        if self.count < self.cells.len() {
+            return;
+        }
+        let mut new_cells = vec![
+            DynamicCell {
+                optim_start: 0,
+                cover_start: 0,
+                compression: 0,
+                score: 0,
+                pattern_idx: 0,
+            };
+            self.count * 2
+        ];
+        if self.tail > self.head {
+            new_cells[..self.tail - self.head].copy_from_slice(&self.cells[self.head..self.tail]);
+        } else {
+            let n = self.cells.len() - self.head;
+            new_cells[..n].copy_from_slice(&self.cells[self.head..]);
+            new_cells[n..n + self.tail].copy_from_slice(&self.cells[..self.tail]);
+        }
+        self.head = 0;
+        self.tail = self.count;
+        self.cells = new_cells;
+    }
+
+    // From Go: PushFront - compress.go:722-730
+    pub fn push_front(&mut self) -> &mut DynamicCell {
+        self.ensure_size();
+        if self.head == 0 {
+            self.head = self.cells.len();
+        }
+        self.head -= 1;
+        self.count += 1;
+        &mut self.cells[self.head]
+    }
+
+    // From Go: PushBack - compress.go:732-741
+    pub fn push_back(&mut self) -> &mut DynamicCell {
+        self.ensure_size();
+        let idx = self.tail;
+        if self.tail == self.cells.len() - 1 {
+            self.tail = 0;
+        } else {
+            self.tail += 1;
+        }
+        self.count += 1;
+        &mut self.cells[idx]
+    }
+
+    // From Go: Len - compress.go:743-745
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    // From Go: Get - compress.go:747-752
+    pub fn get(&mut self, i: usize) -> &mut DynamicCell {
+        if i >= self.count {
+            panic!("Ring::get index out of bounds");
+        }
+        let idx = (self.head + i) % self.cells.len();
+        &mut self.cells[idx]
+    }
+
+    // From Go: Truncate - compress.go:754-758
+    pub fn truncate(&mut self, i: usize) {
+        self.count = i;
+        self.tail = (self.head + i) % self.cells.len();
+    }
 }
 
 // From Go: BitWriter struct (from compress.go)
@@ -782,7 +858,17 @@ fn calculate_ratio(uncompressed_path: &str, compressed_path: &str) -> std::resul
     let uncompressed_meta = fs::metadata(uncompressed_path)?;
     let compressed_meta = fs::metadata(compressed_path)?;
     
-    let ratio = uncompressed_meta.len() as f64 / compressed_meta.len() as f64;
+    let uncompressed_size = uncompressed_meta.len();
+    let compressed_size = compressed_meta.len();
+    
+    log::debug!("Uncompressed size: {}, Compressed size: {}", uncompressed_size, compressed_size);
+    
+    if compressed_size == 0 {
+        // If compressed file is empty, return 0 ratio
+        return Ok(0.0);
+    }
+    
+    let ratio = uncompressed_size as f64 / compressed_size as f64;
     Ok(ratio)
 }
 

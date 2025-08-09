@@ -12,32 +12,70 @@ pub type CompressionQueue = Vec<CompressionWord>;
 // Helper struct for pattern matching
 // Replaces patricia.MatchFinder2 from Go
 pub struct MatchFinder {
-    trie: Trie<Vec<u8>, usize>, // Maps pattern to pattern index
+    trie: Trie<Vec<u8>, Box<Pattern>>, // Maps pattern bytes to Pattern objects
+    patterns: Vec<Box<Pattern>>, // Keep patterns alive
 }
 
 impl MatchFinder {
     pub fn new() -> Self {
-        MatchFinder { trie: Trie::new() }
+        MatchFinder { 
+            trie: Trie::new(),
+            patterns: Vec::new(),
+        }
     }
 
-    pub fn insert(&mut self, pattern: Vec<u8>, index: usize) {
-        self.trie.insert(pattern, index);
+    pub fn insert(&mut self, pattern: Pattern) {
+        let pattern_box = Box::new(pattern);
+        let pattern_ptr = pattern_box.clone();
+        self.trie.insert(pattern_box.word.clone(), pattern_ptr);
+        self.patterns.push(pattern_box);
     }
 
-    // Find all patterns that match at current position in input
-    pub fn find_matches(&self, input: &[u8], pos: usize) -> Vec<(usize, usize)> {
-        // Returns Vec of (pattern_index, pattern_length)
+    // Find all patterns that match starting at any position in input
+    // This is equivalent to Go's FindLongestMatches
+    pub fn find_longest_matches(&self, input: &[u8]) -> Vec<Match> {
         let mut matches = Vec::new();
-
-        // Check all possible pattern lengths at current position
-        for len in 1..=input.len().saturating_sub(pos) {
-            if let Some(&pattern_idx) = self.trie.get(&input[pos..pos + len]) {
-                matches.push((pattern_idx, len));
+        
+        // For each starting position in input
+        for start in 0..input.len() {
+            // Check all possible pattern lengths from this position
+            for end in (start + 1)..=input.len().min(start + 128) { // Max pattern len
+                if let Some(pattern) = self.trie.get(&input[start..end]) {
+                    matches.push(Match {
+                        pattern: pattern.clone(),
+                        start,
+                        end,
+                    });
+                }
             }
         }
-
-        matches
+        
+        // Sort matches by start position, then by length (longest first)
+        matches.sort_by(|a, b| {
+            a.start.cmp(&b.start)
+                .then_with(|| b.end.cmp(&a.end))
+        });
+        
+        // Remove overlapping shorter matches
+        let mut filtered = Vec::new();
+        let mut last_end = 0;
+        
+        for m in matches {
+            if m.start >= last_end {
+                last_end = m.end;
+                filtered.push(m);
+            }
+        }
+        
+        filtered
     }
+}
+
+// Equivalent to Go's Match struct
+pub struct Match {
+    pub pattern: Box<Pattern>, // The pattern that matched
+    pub start: usize,          // Start position in input
+    pub end: usize,            // End position in input
 }
 
 // From Go: coverWordByPatterns function
@@ -50,15 +88,171 @@ pub fn cover_word_by_patterns(
     uncovered: &mut Vec<usize>,
     patterns: &mut Vec<usize>,
     cell_ring: &mut Ring,
-    pos_map: &std::collections::HashMap<u64, u64>,
+    pos_map: &mut std::collections::HashMap<u64, u64>,
 ) -> (Vec<u8>, Vec<usize>, Vec<usize>) {
-    // Go: parallel_compress.go:42-177
-    // This is the dynamic programming algorithm for optimal pattern coverage
-
-    // TODO: Implement the DP algorithm
-    // For now, return the inputs unchanged
-    (output.clone(), uncovered.clone(), patterns.clone())
+    // Go: parallel_compress.go:42-179
+    
+    // Clear output buffer
+    output.clear();
+    
+    // Find all pattern matches in the input
+    let matches = match_finder.find_longest_matches(input);
+    
+    // Go: parallel_compress.go:45-48
+    if matches.is_empty() {
+        // No patterns found - encode as uncompressed
+        output.push(0); // Encoding of 0 in VarUint is 1 zero byte
+        output.extend_from_slice(input);
+        return (output.clone(), patterns.clone(), uncovered.clone());
+    }
+    
+    if trace {
+        println!("Cluster | input = {:?}", input);
+        for match_info in &matches {
+            println!(" [{:?} {}-{}]", &input[match_info.start..match_info.end], match_info.start, match_info.end);
+        }
+    }
+    
+    // Go: parallel_compress.go:56-66
+    // Initialize dynamic programming ring buffer
+    cell_ring.reset();
+    patterns.clear();
+    patterns.push(0); // Sentinel entry
+    patterns.push(0);
+    
+    // Initialize cells for the last match
+    if let Some(last_match) = matches.last() {
+        for j in last_match.start..last_match.end {
+            let d = cell_ring.push_back();
+            d.optim_start = j + 1;
+            d.cover_start = input.len();
+            d.compression = 0;
+            d.pattern_idx = 0;
+            d.score = 0;
+        }
+    }
+    
+    // Go: parallel_compress.go:68-128
+    // Dynamic programming to find optimal pattern coverage
+    for i in (0..matches.len()).rev() {
+        let f = &matches[i];
+        let first_cell = cell_ring.get(0);
+        let mut max_compression = first_cell.compression;
+        let mut max_score = first_cell.score;
+        let mut max_cell_idx = 0;
+        let mut max_include = false;
+        
+        for e in 0..cell_ring.len() {
+            let cell = cell_ring.get(e);
+            let mut comp = cell.compression as i32 - 4; // Cost of encoding pattern
+            
+            if cell.cover_start >= f.end {
+                comp += (f.end - f.start) as i32;
+            } else {
+                comp += (cell.cover_start - f.start) as i32;
+            }
+            
+            let score = cell.score + f.pattern.score;
+            
+            if comp > max_compression || (comp == max_compression && score > max_score) {
+                max_compression = comp;
+                max_score = score;
+                max_include = true;
+                max_cell_idx = e;  // Store the index, not a reference
+            } else if cell.optim_start > f.end {
+                cell_ring.truncate(e);
+                break;
+            }
+        }
+        
+        // Push front first
+        cell_ring.push_front();
+        
+        // After push_front, all indices shift by 1
+        let adjusted_idx = max_cell_idx + 1;
+        
+        // Get the values we need from max_cell
+        let max_cell_pattern_idx = cell_ring.get(adjusted_idx).pattern_idx;
+        let max_cell_cover_start = cell_ring.get(adjusted_idx).cover_start;
+        
+        // Now mutate the new front cell (index 0)
+        let d = cell_ring.get(0);
+        d.optim_start = f.start;
+        d.score = max_score;
+        d.compression = max_compression;
+        
+        if max_include {
+            d.cover_start = f.start;
+            d.pattern_idx = patterns.len();
+            patterns.push(i);
+            patterns.push(max_cell_pattern_idx);
+        } else {
+            d.cover_start = max_cell_cover_start;
+            d.pattern_idx = max_cell_pattern_idx;
+        }
+    }
+    
+    // Go: parallel_compress.go:129-178
+    // Build output from optimal solution
+    let optim_cell = cell_ring.get(0);
+    
+    // Count number of patterns
+    let mut pattern_count = 0u64;
+    let mut pattern_idx = optim_cell.pattern_idx;
+    while pattern_idx != 0 {
+        pattern_count += 1;
+        pattern_idx = patterns[pattern_idx + 1];
+    }
+    
+    // Write pattern count
+    let mut num_buf = [0u8; 10];
+    let n = encode_varint(&mut num_buf, pattern_count);
+    output.extend_from_slice(&num_buf[..n]);
+    
+    // Write patterns and track uncovered regions
+    pattern_idx = optim_cell.pattern_idx;
+    let mut last_start = 0;
+    let mut last_uncovered = 0;
+    uncovered.clear();
+    
+    while pattern_idx != 0 {
+        let pattern_match_idx = patterns[pattern_idx];
+        let pattern_match = &matches[pattern_match_idx];
+        
+        if pattern_match.start > last_uncovered {
+            uncovered.push(last_uncovered);
+            uncovered.push(pattern_match.start);
+        }
+        last_uncovered = pattern_match.end;
+        
+        // Starting position
+        *pos_map.entry((pattern_match.start - last_start + 1) as u64).or_insert(0) += 1;
+        last_start = pattern_match.start;
+        
+        // Write position
+        let n = encode_varint(&mut num_buf, pattern_match.start as u64);
+        output.extend_from_slice(&num_buf[..n]);
+        
+        // Write pattern code
+        let n = encode_varint(&mut num_buf, pattern_match.pattern.code);
+        output.extend_from_slice(&num_buf[..n]);
+        
+        pattern_idx = patterns[pattern_idx + 1];
+    }
+    
+    if input.len() > last_uncovered {
+        uncovered.push(last_uncovered);
+        uncovered.push(input.len());
+    }
+    
+    // Add uncoded input
+    for i in (0..uncovered.len()).step_by(2) {
+        output.extend_from_slice(&input[uncovered[i]..uncovered[i + 1]]);
+    }
+    
+    (output.clone(), patterns.clone(), uncovered.clone())
 }
+
 
 // From Go: Huffman tree building for patterns
 // Go: parallel_compress.go:433-524
@@ -152,7 +346,7 @@ pub fn compress_with_pattern_candidates(
         pattern.uses = 0;
         pattern.code_bits = 0;
         
-        match_finder.insert(word.to_vec(), code2pattern.len());
+        match_finder.insert(pattern.clone());
         code2pattern.push(pattern);
     });
     
@@ -204,7 +398,7 @@ pub fn compress_with_pattern_candidates(
                     &mut uncovered,
                     &mut patterns,
                     &mut cell_ring,
-                    &uncomp_pos_map,
+                    &mut uncomp_pos_map,
                 );
                 intermediate_w.write_all(&compressed).ok();
                 output_size += compressed.len() as u64;
@@ -236,6 +430,8 @@ pub fn compress_with_pattern_candidates(
     // Flush intermediate file
     intermediate_w.flush()?;
     drop(intermediate_w);
+    
+    log::debug!("[{}] Intermediate file written, processing {} words", log_prefix, out_count);
     
     // Go: parallel_compress.go:453-730
     // Build Huffman codes and write final compressed file
@@ -326,6 +522,8 @@ fn write_compressed_file(
     }
     
     w.flush()?;
+    
+    log::debug!("Compressed file written successfully");
     Ok(())
 }
 
@@ -336,21 +534,110 @@ pub fn extract_patterns_in_superstrings(
     cfg: &crate::compress::Cfg,
 ) -> Vec<Pattern> {
     // Go: parallel_compress.go:744-824
-    // Uses suffix array to find repeated patterns in superstrings
-
-    let mut patterns = Vec::new();
-
+    use cdivsufsort::sort_in_place;
+    use std::collections::HashMap;
+    
+    let mut pattern_map: HashMap<Vec<u8>, u64> = HashMap::new();
+    let min_pattern_len = cfg.min_pattern_len;
+    let max_pattern_len = cfg.max_pattern_len;
+    let min_pattern_score = cfg.min_pattern_score;
+    
     for superstring in superstrings {
-        // Use suffix crate to build suffix array
-        // DEVIATION: suffix crate requires string, not bytes
-        // Converting bytes to string (assuming valid UTF-8 or using lossy conversion)
-        let string_data = String::from_utf8_lossy(&superstring);
-        let suffix_array = suffix::SuffixTable::new(string_data);
-
-        // TODO: Extract patterns from suffix array
-        // For now, just return empty
+        if superstring.is_empty() {
+            continue;
+        }
+        
+        // Build suffix array using divsufsort
+        // Go: parallel_compress.go:764
+        let mut sa = vec![0i32; superstring.len()];
+        sort_in_place(&superstring, &mut sa);
+        
+        // Filter out suffixes that start with odd positions
+        // Go: parallel_compress.go:769-778
+        let n = sa.len() / 2;
+        let mut filtered = Vec::with_capacity(n);
+        for &pos in &sa {
+            if pos & 1 == 0 {
+                filtered.push(pos >> 1); // Divide by 2 to get actual position
+            }
+        }
+        
+        // Build inverse suffix array
+        // Go: parallel_compress.go:779-787
+        let mut inv = vec![0i32; filtered.len()];
+        for (i, &pos) in filtered.iter().enumerate() {
+            if (pos as usize) < inv.len() {
+                inv[pos as usize] = i as i32;
+            }
+        }
+        
+        // Compute LCP array using Kasai's algorithm
+        // Go: parallel_compress.go:789-823
+        let mut lcp = vec![0i32; filtered.len()];
+        let mut k = 0;
+        
+        for i in 0..filtered.len() {
+            if inv[i] == (filtered.len() - 1) as i32 {
+                k = 0;
+                lcp[inv[i] as usize] = 0;
+                continue;
+            }
+            
+            let j = filtered[(inv[i] + 1) as usize] as usize;
+            let i_pos = i;
+            
+            // Compare characters at positions i+k and j+k
+            // Go: parallel_compress.go:814
+            while i_pos + k < filtered.len() 
+                && j + k < filtered.len() 
+                && i_pos * 2 + k * 2 < superstring.len()
+                && j * 2 + k * 2 < superstring.len()
+                && superstring[i_pos * 2 + k * 2] != 0
+                && superstring[j * 2 + k * 2] != 0
+                && superstring[i_pos * 2 + k * 2 + 1] == superstring[j * 2 + k * 2 + 1] 
+            {
+                k += 1;
+            }
+            
+            lcp[inv[i] as usize] = k as i32;
+            
+            if k > 0 {
+                k -= 1;
+            }
+        }
+        
+        // Extract patterns based on LCP values
+        // Patterns are substrings that appear multiple times (LCP > 0)
+        // and meet length and score requirements
+        for i in 0..lcp.len() {
+            let prefix_len = lcp[i] as usize;
+            
+            if prefix_len >= min_pattern_len && prefix_len <= max_pattern_len {
+                let pos = filtered[i] as usize;
+                
+                // Extract the pattern bytes from the superstring
+                // Remember: superstring uses 2 bytes per character
+                let mut pattern_bytes = Vec::with_capacity(prefix_len);
+                for j in 0..prefix_len {
+                    if pos * 2 + j * 2 + 1 < superstring.len() {
+                        pattern_bytes.push(superstring[pos * 2 + j * 2 + 1]);
+                    }
+                }
+                
+                // Increment score for this pattern
+                *pattern_map.entry(pattern_bytes).or_insert(0) += 1;
+            }
+        }
     }
-
+    
+    // Convert to Pattern objects and filter by score
+    let mut patterns = Vec::new();
+    for (word, score) in pattern_map {
+        if score >= min_pattern_score {
+            patterns.push(Pattern::new(word, score));
+        }
+    }
+    
     patterns
 }
 
@@ -369,8 +656,8 @@ impl CompressionWorker {
         let mut trie = MatchFinder::new();
 
         // Build trie from patterns
-        for (idx, pattern) in patterns.iter().enumerate() {
-            trie.insert(pattern.word.clone(), idx);
+        for pattern in patterns {
+            trie.insert(pattern.clone());
         }
 
         CompressionWorker {
@@ -398,12 +685,14 @@ mod tests {
     #[test]
     fn test_match_finder() {
         let mut mf = MatchFinder::new();
-        mf.insert(b"hello".to_vec(), 0);
-        mf.insert(b"world".to_vec(), 1);
+        mf.insert(Pattern::new(b"hello".to_vec(), 100));
+        mf.insert(Pattern::new(b"world".to_vec(), 200));
 
         let input = b"hello world";
-        let matches = mf.find_matches(input, 0);
+        let matches = mf.find_longest_matches(input);
         assert!(!matches.is_empty());
+        assert_eq!(matches[0].start, 0);
+        assert_eq!(matches[0].end, 5);
     }
 
     #[test]
