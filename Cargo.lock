@@ -1028,6 +1028,7 @@ dependencies = [
  "criterion",
  "env_logger",
  "hex",
+ "lazy_static",
  "log",
  "memmap2",
  "radix_trie",

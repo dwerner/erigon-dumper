@@ -23,6 +23,7 @@ log = "0.4"
 # Compression dependencies
 bitvec = "1.0"
 cdivsufsort = "2.0"
+lazy_static = "1.4"
 radix_trie = "0.2"
 
 # Temp files (used in tests and ETL)
