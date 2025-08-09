@@ -87,6 +87,21 @@ impl PatternHuff {
         }
     }
 
+    // Helper function to collect all patterns from the tree
+    pub fn collect_patterns(&self, patterns: &mut Vec<Pattern>) {
+        if let Some(ref p0) = self.p0 {
+            patterns.push((**p0).clone());
+        } else if let Some(ref h0) = self.h0 {
+            h0.collect_patterns(patterns);
+        }
+        
+        if let Some(ref p1) = self.p1 {
+            patterns.push((**p1).clone());
+        } else if let Some(ref h1) = self.h1 {
+            h1.collect_patterns(patterns);
+        }
+    }
+    
     // func (h *PatternHuff) SetDepth(depth int) {
     pub fn set_depth(&mut self, depth: i32) {
         // if h.p0 != nil {
@@ -200,6 +215,21 @@ impl PositionHuff {
         }
     }
 
+    // Helper function to collect all positions from the tree
+    pub fn collect_positions(&self, positions: &mut Vec<Position>) {
+        if let Some(ref p0) = self.p0 {
+            positions.push((**p0).clone());
+        } else if let Some(ref h0) = self.h0 {
+            h0.collect_positions(positions);
+        }
+        
+        if let Some(ref p1) = self.p1 {
+            positions.push((**p1).clone());
+        } else if let Some(ref h1) = self.h1 {
+            h1.collect_positions(positions);
+        }
+    }
+    
     // func (h *PositionHuff) SetDepth(depth int) {
     pub fn set_depth(&mut self, depth: i32) {
         // if h.p0 != nil {

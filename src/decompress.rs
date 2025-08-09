@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 use std::path::Path;
 use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
+use log::debug;
 
 // Decompressor implementation matching Go's seg/decompress.go
 
@@ -27,6 +28,7 @@ pub struct DecompressorOwned {
 
 impl DecompressorOwned {
     pub fn open(path: &Path) -> Result<Self> {
+        debug!("Opening decompressor for file: {:?}", path);
         // println!("Opening decompressor for: {:?}", path);
         let file = File::open(path)?;
         let metadata = file.metadata()?;
@@ -102,7 +104,7 @@ impl<'a> Decompressor<'a> {
         let empty_words_count = u64::from_be_bytes(data[8..16].try_into().unwrap());
         let dict_size = u64::from_be_bytes(data[16..24].try_into().unwrap());
         
-        println!("Decompressor header: words_count={}, empty_words_count={}, dict_size={}", 
+        debug!("Decompressor header: words_count={}, empty_words_count={}, dict_size={}", 
                  words_count, empty_words_count, dict_size);
         
         if 24 + dict_size > data.len() as u64 {
@@ -126,7 +128,7 @@ impl<'a> Decompressor<'a> {
         let pos_dict_size = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
         
-        println!("Position dictionary size: {}", pos_dict_size);
+        debug!("Position dictionary size: {}", pos_dict_size);
         
         let pos_dict = if pos_dict_size > 0 {
             let dict_data = &data[pos..pos + pos_dict_size as usize];
@@ -137,6 +139,7 @@ impl<'a> Decompressor<'a> {
         pos += pos_dict_size as usize;
 
         let words_start = pos;
+        debug!("Words start at position: {}, file size: {}", words_start, data.len());
 
         Ok(Decompressor {
             data,
@@ -179,11 +182,11 @@ impl<'a> Decompressor<'a> {
             pos += len as usize;
         }
         
-        println!("Parsed {} patterns, max_depth={}", patterns.len(), max_depth);
+        debug!("Parsed {} patterns, max_depth={}", patterns.len(), max_depth);
         
         // Debug: print first few patterns
         for (i, (depth, pattern)) in depths.iter().zip(patterns.iter()).take(5).enumerate() {
-            println!("  Pattern {}: depth={}, data={:?}", i, depth, String::from_utf8_lossy(pattern));
+            debug!("  Pattern {}: depth={}, data={:?}", i, depth, String::from_utf8_lossy(pattern));
         }
 
         // Build pattern table
@@ -216,7 +219,7 @@ impl<'a> Decompressor<'a> {
                 len: bits as u8,
                 ptr: None,
             };
-            println!("    Building pattern table: inserting pattern at depth={}, code={}, bits={}, pattern={:?}, table.bit_len={}", 
+            debug!("    Building pattern table: inserting pattern at depth={}, code={}, bits={}, pattern={:?}, table.bit_len={}", 
                      depth, code, bits, String::from_utf8_lossy(&patterns[0]), table.bit_len);
             table.insert_word(cw);
             return Ok(1);
@@ -225,7 +228,7 @@ impl<'a> Decompressor<'a> {
         if bits == 9 {
             let bit_len = if max_depth > 9 { 9 } else { max_depth as usize };
             let mut new_table = Box::new(PatternTable::new(bit_len));
-            println!("    Creating deeper table at depth={}, code={}, new bit_len={}", depth, code, bit_len);
+            debug!("    Creating deeper table at depth={}, code={}, new bit_len={}", depth, code, bit_len);
             let count = Self::build_condensed_pattern_table(
                 &mut new_table,
                 depths,
@@ -242,7 +245,7 @@ impl<'a> Decompressor<'a> {
                 len: 0,
                 ptr: Some(new_table),
             };
-            println!("    Inserting pointer to deeper table at code={}", code);
+            debug!("    Inserting pointer to deeper table at code={}", code);
             table.insert_word(cw);
             return Ok(count);
         }
@@ -269,7 +272,7 @@ impl<'a> Decompressor<'a> {
             table,
             &depths[b0..],
             &patterns[b0..],
-            (1 << bits) | code,
+            (1u16 << bits) | code,
             bits + 1,
             depth + 1,
             remaining_depth,
@@ -299,17 +302,17 @@ impl<'a> Decompressor<'a> {
             let (position, n) = decode_varint(&data[pos..])?;
             pos += n;
             positions.push(position);
-            println!("  Parsed position entry: depth={}, position={}", depth, position);
+            debug!("  Parsed position entry: depth={}, position={}", depth, position);
         }
         
-        println!("  Parsed {} positions, max_depth={}", positions.len(), max_depth);
+        debug!("  Parsed {} positions, max_depth={}", positions.len(), max_depth);
         if positions.len() > 0 {
-            println!("  First few positions: {:?}", &positions[..positions.len().min(5)]);
+            debug!("  First few positions: {:?}", &positions[..positions.len().min(5)]);
         }
 
         let bit_len = if max_depth > 9 { 9 } else { max_depth as usize };
         let table_size = 1 << bit_len;
-        println!("Creating pos table: bit_len={}, table_size={}, max_depth={}", bit_len, table_size, max_depth);
+        debug!("Creating pos table: bit_len={}, table_size={}, max_depth={}", bit_len, table_size, max_depth);
         let mut table = PosTable {
             bit_len,
             pos: vec![0; table_size],
@@ -318,6 +321,15 @@ impl<'a> Decompressor<'a> {
         };
 
         Self::build_pos_table(&mut table, &depths, &positions, 0, 0, 0, max_depth)?;
+        
+        // Debug: show what's in the table
+        debug!("Position table built:");
+        for i in 0..table.pos.len().min(16) {
+            if table.lens[i] > 0 {
+                debug!("  table[{}]: pos={}, len={}", i, table.pos[i], table.lens[i]);
+            }
+        }
+        
         Ok(table)
     }
 
@@ -334,19 +346,14 @@ impl<'a> Decompressor<'a> {
             return Ok(0);
         }
 
-        // Stop recursion if we've gone past the next item
-        if depth > depths[0] {
-            return Ok(0);
-        }
-
         if depth == depths[0] {
             let p = positions[0];
-            println!("    Building pos table entry: code={} (0b{:b}), bits={}, pos={}, table.bit_len={}", 
+            debug!("    Building pos table entry: code={} (0b{:b}), bits={}, pos={}, table.bit_len={}", 
                      code, code, bits, p, table.bit_len);
             if table.bit_len == bits {
                 table.pos[code as usize] = p;
                 table.lens[code as usize] = bits as u8;
-                println!("      Set table[{}] = pos={}, bits={}", code, p, bits);
+                debug!("      Set table[{}] = pos={}, bits={}", code, p, bits);
             } else {
                 let code_step = 1u16 << bits;
                 let code_to = code | (1u16 << table.bit_len);
@@ -354,7 +361,7 @@ impl<'a> Decompressor<'a> {
                 while c < code_to {
                     table.pos[c as usize] = p;
                     table.lens[c as usize] = bits as u8;
-                    println!("      Set table[{}] = pos={}, bits={}", c, p, bits);
+                    debug!("      Set table[{}] = pos={}, bits={}", c, p, bits);
                     c += code_step;
                 }
             }
@@ -385,10 +392,13 @@ impl<'a> Decompressor<'a> {
             return Ok(count);
         }
 
-        // Now we can safely subtract since we checked max_depth > 0 above
+        if max_depth == 0 {
+            return Err(Error::InvalidFormat("buildPosTable: maxDepth reached zero".into()));
+        }
         let remaining_depth = max_depth - 1;
         
-        println!("    Recursing: depth={}, bits={}, code={:b}, depths[0]={}", depth, bits, code, depths[0]);
+        debug!("    Recursing: depth={}, bits={}, code={:b}, depths[0]={}, remaining positions: {}", 
+                 depth, bits, code, depths[0], depths.len());
         
         let b0 = Self::build_pos_table(
             table,
@@ -400,16 +410,19 @@ impl<'a> Decompressor<'a> {
             remaining_depth,
         )?;
         
+        debug!("    Left subtree consumed {} positions, {} remaining", b0, depths.len() - b0);
+        
         let b1 = Self::build_pos_table(
             table,
             &depths[b0..],
             &positions[b0..],
-            (1 << bits) | code,
+            (1u16 << bits) | code,
             bits + 1,
             depth + 1,
             remaining_depth,
         )?;
         
+        debug!("    Right subtree consumed {} positions", b1);
         Ok(b0 + b1)
     }
 
@@ -571,54 +584,44 @@ impl<'a> Getter<'a> {
         // Direct port of Go's Next() - decompress.go lines 669-733
         let save_pos = self.data_p;
         let mut word_len = self.next_pos(true)?;
+        debug!("next(): Initial word_len from next_pos = {}", word_len);
         word_len = if word_len > 0 { word_len - 1 } else { 0 }; // because when create huffman tree we do ++, because 0 is terminator
+        debug!("next(): Adjusted word_len = {}", word_len);
         
         if word_len == 0 {
-            // Handle empty word case - still need to read terminator but no data
-            // For the case with no patterns, use the simple NextUncompressed approach
-            if self.pattern_dict.is_none() {
+            // Port of Go's lines 673-681: empty word handling
+            // When there's a pattern dictionary, we need to read the terminator position
+            // but NOT align to byte boundary as the position stream continues
+            if self.pattern_dict.is_some() {
                 // Read terminator position (should be 0)
                 let terminator = self.next_pos(false)?;
-                println!("    Empty word - read terminator: {}", terminator);
-                
-                // Switch to data mode if needed but don't read any data
-                // Empty word - no data needed
-                
-                return Ok(vec![]);
+                debug!("next(): Empty word with patterns, read terminator: {}", terminator);
             } else {
-                // Handle empty word with patterns - same logic but no data to read
-                loop {
-                    let pos = self.next_pos(false)?;
-                    if pos == 0 {
-                        break;
-                    }
-                    // Skip any patterns
-                    if let Some(dict) = self.pattern_dict {
-                        self.next_pattern(dict)?;
-                    }
+                // No patterns - just align to byte boundary if needed
+                if self.data_bit > 0 {
+                    self.data_p += 1;
+                    self.data_bit = 0;
                 }
-                
-                // Empty word with patterns - no data needed
-                
-                return Ok(vec![]);
             }
+            debug!("next(): Returning empty word");
+            return Ok(vec![]);
         }
         
         // For the case with no patterns, use the simple NextUncompressed approach
         if self.pattern_dict.is_none() {
             // Read terminator position (should be 0)
             let terminator = self.next_pos(false)?;
-            println!("    Read terminator: {}", terminator);
+            debug!("    Read terminator: {}", terminator);
             
             // Switch to data mode if this is the first time reading data
             // After reading positions, align to byte boundary for data
             if self.data_bit > 0 {
                 self.data_p += 1;
                 self.data_bit = 0;
-                println!("    Aligned to byte boundary for data: data_p={}", self.data_p);
+                debug!("    Aligned to byte boundary for data: data_p={}", self.data_p);
             }
             
-            println!("    Reading {} bytes from data_p={}", word_len, self.data_p);
+            debug!("    Reading {} bytes from data_p={}", word_len, self.data_p);
             
             // Read word data directly
             if self.data_p + word_len as u64 > self.data.len() as u64 {
@@ -628,7 +631,7 @@ impl<'a> Getter<'a> {
             let word = self.data[self.data_p as usize..(self.data_p + word_len as u64) as usize].to_vec();
             self.data_p += word_len as u64;
             
-            println!("    NO PATTERN DICT: Returning word: {:?} ('{}') len={}", word, String::from_utf8_lossy(&word), word.len());
+            debug!("    NO PATTERN DICT: Returning word: {:?} ('{}') len={}", word, String::from_utf8_lossy(&word), word.len());
             return Ok(word);
         }
         
@@ -641,12 +644,12 @@ impl<'a> Getter<'a> {
         // First pass: place patterns in the word buffer
         let mut buf_pos = 0usize;
         let mut pattern_count = 0;
-        println!("    First pass: placing patterns");
+        debug!("next(): First pass - placing patterns for word_len={}", word_len);
         loop {
             let pos = self.next_pos(false)?;
-            println!("    First pass: read pos={}", pos);
+            debug!("    First pass: read pos={}", pos);
             if pos == 0 {
-                println!("    First pass: terminator found, ending loop");
+                debug!("    First pass: terminator found, ending loop");
                 break;
             }
             
@@ -656,17 +659,18 @@ impl<'a> Getter<'a> {
             }
             
             buf_pos += pos - 1; // Positions are relative to each other
-            println!("    First pass: buf_pos now = {}", buf_pos);
+            debug!("    First pass: buf_pos now = {}", buf_pos);
             
             if let Some(dict) = self.pattern_dict {
-                println!("    About to read pattern with dict at data_p={}, data_bit={}", self.data_p, self.data_bit);
+                debug!("next(): About to read pattern with dict at data_p={}, data_bit={}", self.data_p, self.data_bit);
                 let pattern = self.next_pattern(dict)?;
-                println!("    First pass: decoded pattern {:?} at buf_pos={}", String::from_utf8_lossy(&pattern), buf_pos);
+                debug!("next(): First pass - decoded pattern {:?} (len={}) at buf_pos={}", 
+                       String::from_utf8_lossy(&pattern), pattern.len(), buf_pos);
                 if buf_pos < result.len() && buf_pos + pattern.len() <= result.len() {
                     result[buf_pos..buf_pos + pattern.len()].copy_from_slice(&pattern);
-                    println!("      Placed pattern at buf_pos={}", buf_pos);
+                    debug!("      Placed pattern at buf_pos={}", buf_pos);
                 } else {
-                    println!("      Pattern out of bounds: buf_pos={}, pattern_len={}, result_len={}", buf_pos, pattern.len(), result.len());
+                    debug!("      Pattern out of bounds: buf_pos={}, pattern_len={}, result_len={}", buf_pos, pattern.len(), result.len());
                 }
             }
         }
@@ -691,7 +695,7 @@ impl<'a> Getter<'a> {
             self.data_p
         };
         
-        println!("    Second pass: filling uncovered bytes, data starts at {}", uncovered_data_start);
+        debug!("    Second pass: filling uncovered bytes, data starts at {}", uncovered_data_start);
         
         loop {
             let pos = self.next_pos(false)?;
@@ -704,7 +708,7 @@ impl<'a> Getter<'a> {
             // Fill gap before pattern with uncovered data
             if buf_pos > last_uncovered {
                 let gap_size = buf_pos - last_uncovered;
-                println!("      Filling gap at [{}..{}] with {} bytes from offset {}", 
+                debug!("      Filling gap at [{}..{}] with {} bytes from offset {}", 
                          last_uncovered, buf_pos, gap_size, uncovered_data_offset);
                 
                 if uncovered_data_start + uncovered_data_offset as u64 + gap_size as u64 <= self.data.len() as u64 {
@@ -720,14 +724,14 @@ impl<'a> Getter<'a> {
             if let Some(dict) = self.pattern_dict {
                 let pattern = self.next_pattern(dict)?;
                 last_uncovered = buf_pos + pattern.len();
-                println!("      Skipped pattern of length {}, last_uncovered now = {}", pattern.len(), last_uncovered);
+                debug!("      Skipped pattern of length {}, last_uncovered now = {}", pattern.len(), last_uncovered);
             }
         }
         
         // Fill remaining uncovered bytes at the end
         if word_len > last_uncovered {
             let remaining_size = word_len - last_uncovered;
-            println!("      Filling remaining gap at [{}..{}] with {} bytes", 
+            debug!("      Filling remaining gap at [{}..{}] with {} bytes", 
                      last_uncovered, word_len, remaining_size);
             
             if uncovered_data_start + uncovered_data_offset as u64 + remaining_size as u64 <= self.data.len() as u64 {
@@ -744,7 +748,7 @@ impl<'a> Getter<'a> {
         self.data_bit = 0;
         // Data mode tracking no longer needed with single stream
         
-        println!("    Pattern case - returning word: {:?} ('{}')", result, String::from_utf8_lossy(&result));
+        debug!("    Pattern case - returning word: {:?} ('{}')", result, String::from_utf8_lossy(&result));
         Ok(result)
     }
     
@@ -792,7 +796,7 @@ impl<'a> Getter<'a> {
     fn next_pos(&mut self, clean: bool) -> Result<usize> {
         if let Some(pos_dict) = self.pos_dict {
             let result = self.next_pos_internal(pos_dict, clean)?;
-            println!("    next_pos with dict returned: {}", result);
+            debug!("    next_pos with dict returned: {}", result);
             Ok(result)
         } else {
             // When no position dictionary, read varint
@@ -808,6 +812,8 @@ impl<'a> Getter<'a> {
 
     fn next_pos_internal(&mut self, table: &PosTable, _clean: bool) -> Result<usize> {
         // Use single stream pointer for reading positions
+        debug!("      next_pos_internal: data_p={}, data_bit={}, bit_len={}", 
+               self.data_p, self.data_bit, table.bit_len);
         
         if table.bit_len == 0 {
             return Ok(table.pos[0] as usize);
@@ -819,14 +825,16 @@ impl<'a> Getter<'a> {
             }
             
             // Read bits from the stream
-            let mut code = (self.data[self.data_p as usize] >> self.data_bit) as u16;
+            let byte_val = self.data[self.data_p as usize];
+            debug!("      Reading byte[{}] = {:08b}, bit_offset={}", self.data_p, byte_val, self.data_bit);
+            let mut code = (byte_val >> self.data_bit) as u16;
             if 8 - self.data_bit < table.bit_len && (self.data_p + 1) < self.data.len() as u64 {
                 code |= (self.data[(self.data_p + 1) as usize] as u16) << (8 - self.data_bit);
             }
             code &= (1u16 << table.bit_len) - 1;
             
             let l = table.lens[code as usize];
-            println!("    next_pos_internal: data_p={}, data_bit={}, code={}, bits={}, pos={}", 
+            debug!("    next_pos_internal: data_p={}, data_bit={}, code={}, bits={}, pos={}", 
                      self.data_p, self.data_bit, code, l, 
                      if l > 0 { table.pos[code as usize] } else { 0 });
             
@@ -852,7 +860,7 @@ impl<'a> Getter<'a> {
     }
 
     fn next_pattern(&mut self, table: &PatternTable) -> Result<Vec<u8>> {
-        println!("      next_pattern: data_p={}, data_bit={}, table.bit_len={}", self.data_p, self.data_bit, table.bit_len);
+        debug!("      next_pattern: data_p={}, data_bit={}, table.bit_len={}", self.data_p, self.data_bit, table.bit_len);
         
         if table.bit_len == 0 {
             return Ok(table.patterns[0].as_ref().map(|cw| cw.pattern.clone()).unwrap_or_default());
@@ -864,22 +872,24 @@ impl<'a> Getter<'a> {
             }
             
             // Read bits like Go version
-            let mut code = (self.data[self.data_p as usize] >> self.data_bit) as u16;
+            let byte_val = self.data[self.data_p as usize];
+            debug!("      next_pattern: Reading byte[{}] = {:08b}, bit_offset={}", self.data_p, byte_val, self.data_bit);
+            let mut code = (byte_val >> self.data_bit) as u16;
             if 8 - self.data_bit < table.bit_len && (self.data_p + 1) < self.data.len() as u64 {
                 code |= (self.data[(self.data_p + 1) as usize] as u16) << (8 - self.data_bit);
             }
             code &= (1u16 << table.bit_len) - 1;
             
-            println!("      Read pattern code={} (0x{:x}) from data_p={}, data_bit={}, table.bit_len={}", 
+            debug!("      Read pattern code={} (0x{:x}) from data_p={}, data_bit={}, table.bit_len={}", 
                      code, code, self.data_p, self.data_bit, table.bit_len);
             
             if let Some(cw) = table.condensed_table_search(code) {
                 let l = cw.len;
-                println!("      Found codeword: len={}, pattern={:?}", l, String::from_utf8_lossy(&cw.pattern));
+                debug!("      Found codeword: len={}, pattern={:?}", l, String::from_utf8_lossy(&cw.pattern));
                 if l == 0 {
                     // Follow pointer to deeper table
                     if let Some(ptr) = &cw.ptr {
-                        println!("      Following pointer to deeper table");
+                        debug!("      Following pointer to deeper table");
                         self.data_bit += 9; // Always advance by 9 bits for table pointers
                         self.data_p += (self.data_bit / 8) as u64;
                         self.data_bit %= 8;
@@ -892,7 +902,7 @@ impl<'a> Getter<'a> {
                     self.data_bit += l as usize;
                     self.data_p += (self.data_bit / 8) as u64;
                     self.data_bit %= 8;
-                    println!("      Returning pattern: {:?}", String::from_utf8_lossy(&cw.pattern));
+                    debug!("      Returning pattern: {:?}", String::from_utf8_lossy(&cw.pattern));
                     return Ok(cw.pattern.clone());
                 }
             } else {

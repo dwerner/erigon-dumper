@@ -18,6 +18,7 @@ bytes = "1.8"
 # Error handling
 thiserror = "2.0"
 tracing = "0.1"
+log = "0.4"
 
 # Temp files (used in tests)
 tempfile = "3.14"
@@ -29,3 +30,4 @@ hex = "0.4"
 criterion = "0.5"
 smol-potat = "1.1"  # Minimal async runtime for tests
 crc32fast = "1.4"  # For checksum tests matching Go
+env_logger = "0.10"  # For test logging

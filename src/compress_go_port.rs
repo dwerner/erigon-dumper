@@ -7,6 +7,7 @@ use std::fs::File;
 use std::path::Path;
 use crate::error::{Result, Error};
 use crate::patricia::Match;
+use log::debug;
 
 // Helper to print byte slices as hex
 fn print_hex(bytes: &[u8]) {
@@ -279,7 +280,7 @@ pub fn cover_word_by_patterns(
     patterns: &mut Vec<i32>,               // patterns []int
     cell_ring: &mut Ring,                  // cellRing *Ring
     pos_map: &mut HashMap<u64, u64>,       // posMap map[uint64]uint64
-    code2pattern: &[Pattern],              // code2pattern []*Pattern - pattern array
+    code2pattern: &mut [Pattern],          // code2pattern []*Pattern - pattern array (mutable)
 ) -> Result<()> {
     // matches := mf2.FindLongestMatches(input)
     // Note: matches is passed in as parameter since we don't have patricia tree yet
@@ -456,6 +457,7 @@ pub fn cover_word_by_patterns(
             // patterns = append(patterns, i-1, maxCell.patternIdx)
             patterns.push((i - 1) as i32);
             patterns.push(max_cell.pattern_idx);
+            debug!("  Selected pattern at match index {}", i - 1);
         } else {
             // if trace {
             if trace {
@@ -561,8 +563,10 @@ pub fn cover_word_by_patterns(
         write_varint(output, p.code)?;
         
         // atomic.AddUint64(&p.uses, 1)
-        // Note: We can't modify p.uses here in Rust due to borrowing rules
-        // This would need to be handled differently
+        // Directly increment the pattern's uses field (like Go)
+        if let Some(pattern) = code2pattern.get_mut(p.code as usize) {
+            pattern.uses += 1;
+        }
         
         // patternIdx = patterns[patternIdx+1]
         pattern_idx = patterns[(pattern_idx + 1) as usize];

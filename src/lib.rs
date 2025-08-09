@@ -10,6 +10,9 @@ pub mod compress_go_port3;
 pub mod patricia;
 pub mod dictionary_builder;
 
+#[cfg(test)]
+mod test_sorting;
+
 pub use error::{Error, Result};
 pub use reader::ErigonReader;
 

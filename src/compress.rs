@@ -9,6 +9,7 @@ use crate::compress_go_port::{Pattern, cover_word_by_patterns};
 use crate::compress_go_port2::{RawWordsFile, compress_with_pattern_candidates, Cfg as InternalCfg};
 use crate::dictionary_builder::DictionaryBuilder;
 use crate::patricia::PatriciaTree;
+use log::debug;
 
 // ========== Port of compress.go Cfg struct ==========
 // type Cfg struct {
@@ -163,6 +164,7 @@ impl Compressor {
             if score < self.cfg.min_pattern_score {
                 return;
             }
+            debug!("Adding pattern: {:?} (score={})", std::str::from_utf8(word).unwrap_or("<non-utf8>"), score);
             // p := &Pattern{
             let p = Pattern {
                 // score:    score,
@@ -203,13 +205,14 @@ impl Compressor {
         };
         
         // err = compressWithPatternCandidates(c.ctx, false, c.cfg, c.logPrefix, c.tmpOutFilePath, cf, c.uncompressedFile, c.dictBuilder, c.lvl, c.logger)
+        debug!("Calling compress_with_pattern_candidates with path: {:?}", self.tmp_out_file_path);
         compress_with_pattern_candidates(
             false, // trace
             &internal_cfg,
             &self.tmp_out_file_path,
             &mut cf,
-            &self.uncompressed_file,
-            &code2pattern,
+            &mut self.uncompressed_file,
+            &mut code2pattern,
             &pt,
         )?;
         
@@ -225,7 +228,9 @@ impl Compressor {
         // if err = os.Rename(c.tmpOutFilePath, c.outputFile); err != nil {
         //     return fmt.Errorf("renaming: %w", err)
         // }
+        debug!("Renaming {:?} to {:?}", self.tmp_out_file_path, self.output_file);
         std::fs::rename(&self.tmp_out_file_path, &self.output_file)?;
+        debug!("Rename successful");
         
         // return nil
         Ok(())
@@ -244,7 +249,8 @@ impl Compressor {
 
 // Re-export functions that tests might use
 pub fn compress_empty_dict(data: &[u8], output_path: &Path) -> Result<()> {
-    let tmp_dir = output_path.parent().unwrap();
+    let tmp_dir = output_path.parent().unwrap_or(Path::new("."));
+    debug!("output_path = {:?}, tmp_dir = {:?}", output_path, tmp_dir);
     let mut cfg = Cfg::default();
     cfg.min_pattern_score = u64::MAX; // No patterns
     

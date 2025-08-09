@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::error::{Result, Error};
 use crate::compress_go_port::{Pattern, DynamicCell, Ring, cover_word_by_patterns};
 use crate::patricia::{PatriciaTree, MatchFinder2, Match};
+use log::debug;
 
 // ========== Port of compress.go lines 525-532 Position struct ==========
 // type Position struct {
@@ -133,8 +134,23 @@ impl RawWordsFile {
         // if err != nil {
         //     return nil, err
         // }
-        let f = File::create(file_path)?;
+        debug!(" RawWordsFile::new creating file at: {}", file_path);
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(file_path).parent() {
+            debug!(" Creating parent directory: {:?}", parent);
+            std::fs::create_dir_all(parent)?;
+        }
+        // Use OpenOptions to open for both reading and writing
+        use std::fs::OpenOptions;
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file_path)?;
+        debug!(" File created successfully");
         // w := bufio.NewWriterSize(f, 2*etl.BufIOSize)
+        // Clone the file handle so we can keep one for seeking and one for the writer
         let w = BufWriter::with_capacity(2 * 8192 * 1024, f.try_clone()?); // 2*etl.BufIOSize
         // return &RawWordsFile{filePath: filePath, f: f, w: w, buf: make([]byte, 128)}, nil
         Ok(RawWordsFile {
@@ -159,6 +175,7 @@ impl RawWordsFile {
         self.w.flush()?;
         // f.f.Close()
         drop(self.f);
+        drop(self.w);
         Ok(())
     }
 
@@ -221,19 +238,27 @@ impl RawWordsFile {
 
     // ========== Port of compress.go lines 889-918 ForEach ==========
     // func (f *RawWordsFile) ForEach(walker func(v []byte, compressed bool) error) error {
-    pub fn for_each<F>(&self, mut walker: F) -> Result<()>
+    pub fn for_each<F>(&mut self, mut walker: F) -> Result<()>
     where
         F: FnMut(&[u8], bool) -> Result<()>,
     {
+        debug!(" for_each called, file_path = {}", self.file_path);
+        // First flush any pending writes
+        self.w.flush()?;
+        debug!(" Flushed writer");
+        
         // _, err := f.f.Seek(0, 0)
         // if err != nil {
         //     return err
         // }
-        let mut f = File::open(&self.file_path)?;
-        f.seek(SeekFrom::Start(0))?;
+        // Now we can seek on our file handle directly!
+        debug!(" Seeking to start of file");
+        self.f.seek(SeekFrom::Start(0))?;
+        debug!(" Seek successful");
         
         // r := bufio.NewReaderSize(f.f, int(8*datasize.MB))
-        let mut r = BufReader::with_capacity(8 * 1024 * 1024, f);
+        // Clone the file handle for reading since BufReader will take ownership
+        let mut r = BufReader::with_capacity(8 * 1024 * 1024, self.f.try_clone()?);
         
         // buf := make([]byte, 16*1024)
         let mut buf = vec![0u8; 16 * 1024];
@@ -241,9 +266,16 @@ impl RawWordsFile {
         // l, e := binary.ReadUvarint(r)
         // for ; e == nil; l, e = binary.ReadUvarint(r) {
         loop {
+            debug!(" Reading uvarint from file");
             let l = match read_uvarint(&mut r) {
-                Ok(v) => v,
-                Err(_) => break, // EOF
+                Ok(v) => {
+                    debug!(" Read uvarint value: {}", v);
+                    v
+                },
+                Err(e) => {
+                    debug!(" Error reading uvarint: {:?}", e);
+                    break; // EOF
+                }
             };
             
             // compressed := (l & 1) == 0
@@ -283,8 +315,8 @@ pub fn compress_with_pattern_candidates(
     cfg: &Cfg,                          // cfg Cfg
     segment_file_path: &Path,           // segmentFilePath string
     cf: &mut File,                      // cf *os.File
-    uncompressed_file: &RawWordsFile,   // uncompressedFile *RawWordsFile
-    code2pattern: &[Pattern],           // code2pattern from dictBuilder
+    uncompressed_file: &mut RawWordsFile,   // uncompressedFile *RawWordsFile
+    code2pattern: &mut [Pattern],       // code2pattern from dictBuilder (mutable for uses tracking)
     pt: &PatriciaTree,                  // PatriciaTree built from patterns
 ) -> Result<()> {
     // Lines 239-241: Setup logging
@@ -315,7 +347,8 @@ pub fn compress_with_pattern_candidates(
     
     // Lines 290-310: Setup intermediate file
     // intermediatePath := segmentFilePath + ".tmp"
-    let intermediate_path = segment_file_path.with_extension("tmp");
+    let intermediate_path = segment_file_path.with_extension("intermediate.tmp");
+    debug!(" Creating intermediate file at: {:?}", intermediate_path);
     // defer os.Remove(intermediatePath)
     // Note: We'll handle cleanup manually
     
@@ -324,6 +357,7 @@ pub fn compress_with_pattern_candidates(
     //     return fmt.Errorf("create intermediate file: %w", err)
     // }
     let intermediate_file = File::create(&intermediate_path)?;
+    debug!(" Intermediate file created successfully");
     // defer intermediateFile.Close()
     
     // intermediateW := bufio.NewWriterSize(intermediateFile, 8*etl.BufIOSize)
@@ -334,15 +368,21 @@ pub fn compress_with_pattern_candidates(
     let mut in_count = 0u64;
     let mut out_count = 0u64;
     let mut empty_words_count = 0u64;
+    debug!(" Starting word processing loop");
+    
+    // code2pattern is now mutable so we can track uses directly in Pattern structs
     
     // var numBuf [binary.MaxVarintLen64]byte
     let mut num_buf = vec![0u8; 10]; // MaxVarintLen64
     
     // totalWords := uncompressedFile.count
     let total_words = uncompressed_file.count;
+    debug!(" Total words to process: {}", total_words);
     
     // if err = uncompressedFile.ForEach(func(v []byte, compression bool) error {
     uncompressed_file.for_each(|v, compression| {
+        debug!("Processing word {:?} of length {}, compression={}", 
+               std::str::from_utf8(&v).unwrap_or("<non-utf8>"), v.len(), compression);
         // Lines 360-398: Process each word
         // if cfg.Workers > 1 {
         // Note: Single-threaded version
@@ -364,6 +404,15 @@ pub fn compress_with_pattern_candidates(
             if compression {
                 // output, patterns, uncovered = coverWordByPatterns(trace, v, mf2, output[:0], uncovered, patterns, cellRing, uncompPosMap)
                 let matches = mf2.find_longest_matches(v);
+                #[cfg(debug_assertions)]
+                {
+                    debug!("Found {} matches for word {:?}", matches.len(), 
+                          std::str::from_utf8(&v).unwrap_or("<non-utf8>"));
+                    for (i, m) in matches.iter().enumerate() {
+                        debug!("  Match {}: start={}, end={}, pattern_idx={}", 
+                               i, m.start, m.end, m.val);
+                    }
+                }
                 
                 // output, patterns, uncovered = coverWordByPatterns(trace, v, mf2, output[:0], uncovered, patterns, cellRing, uncompPosMap)
                 output.clear();
@@ -379,9 +428,20 @@ pub fn compress_with_pattern_candidates(
                     code2pattern,
                 )?;
                 
+                // Update pattern uses based on what was written to output
+                // The first byte in output is the pattern count
+                if output.len() > 0 {
+                    let pattern_count = output[0];
+                    debug!("Used {} patterns for word {:?}", pattern_count,
+                          std::str::from_utf8(&v).unwrap_or("<non-utf8>"));
+                    // Note: We need to track which patterns were used
+                    // This is a limitation of the current port
+                }
+                
                 // if _, e := intermediateW.Write(output); e != nil {
                 //     return e
                 // }
+                debug!(" Writing compressed output of length {}", output.len());
                 intermediate_w.write_all(&output)?;
             // } else {
             } else {
@@ -427,18 +487,21 @@ pub fn compress_with_pattern_candidates(
     
     // Continue with Huffman tree building and final compression pass (lines 461-730)
     
-    // Build pattern list for Huffman encoding
+    // Build pattern list for Huffman encoding from patterns with uses > 0
     let mut pattern_list: Vec<Pattern> = Vec::new();
-    for p in code2pattern {
+    debug!(" code2pattern has {} patterns", code2pattern.len());
+    for p in code2pattern.iter() {
         if p.uses > 0 {
+            debug!(" Adding pattern with uses={}", p.uses);
             pattern_list.push(p.clone());
         }
     }
+    debug!(" pattern_list has {} patterns with uses > 0", pattern_list.len());
     
     // Sort patterns by usage for Huffman tree
     pattern_list.sort_by(|a, b| {
         if a.uses == b.uses {
-            b.code.reverse_bits().cmp(&a.code.reverse_bits())
+            a.code.reverse_bits().cmp(&b.code.reverse_bits())  // Ascending order like Go
         } else {
             a.uses.cmp(&b.uses)
         }
@@ -495,6 +558,34 @@ pub fn compress_with_pattern_candidates(
     if code_heap.len() > 0 {
         let mut root = code_heap.pop().unwrap();
         root.set_depth(0);
+        
+        // Collect all patterns from the Huffman tree to update codes
+        let mut huffman_patterns = Vec::new();
+        root.collect_patterns(&mut huffman_patterns);
+        
+        // Update the original pattern_list with the code and depth from Huffman tree
+        for hp in &huffman_patterns {
+            for p in &mut pattern_list {
+                if p.word == hp.word {
+                    p.code = hp.code;
+                    p.code_bits = hp.code_bits;
+                    p.depth = hp.depth;
+                    p.uses = hp.uses;  // SetDepth sets uses=0 in Go
+                    break;
+                }
+            }
+        }
+        
+        debug!(" Pattern list after Huffman:");
+        for (i, p) in pattern_list.iter().enumerate() {
+            eprintln!("  [{}] word={:?}, code={}, bits={}, depth={}, uses={}", 
+                i, 
+                std::str::from_utf8(&p.word).unwrap_or("<non-utf8>"),
+                p.code,
+                p.code_bits,
+                p.depth,
+                p.uses);
+        }
     }
     
     // Calculate pattern dictionary size
@@ -510,6 +601,7 @@ pub fn compress_with_pattern_candidates(
     use std::io::{BufWriter, BufReader, Seek, SeekFrom};
     let mut cw = BufWriter::with_capacity(2 * 8192 * 1024, cf);
     
+    debug!(" Writing headers - in_count={}, empty_words_count={}", in_count, empty_words_count);
     
     // Write file headers
     num_buf[..8].copy_from_slice(&in_count.to_be_bytes());
@@ -520,15 +612,29 @@ pub fn compress_with_pattern_candidates(
     cw.write_all(&num_buf[..8])?;
     
     // Write pattern dictionary
+    debug!("Pattern list before sorting for dictionary:");
+    for (i, p) in pattern_list.iter().enumerate() {
+        debug!("  [{}] word={:?}, code={}, uses={}", i, 
+               std::str::from_utf8(&p.word).unwrap_or("<non-utf8>"), p.code, p.uses);
+    }
     pattern_list.sort_by(|a, b| {
         if a.uses == b.uses {
-            b.code.reverse_bits().cmp(&a.code.reverse_bits())
+            let a_rev = a.code.reverse_bits();
+            let b_rev = b.code.reverse_bits();
+            debug!("  Comparing {:?} (code={}, rev={:x}) vs {:?} (code={}, rev={:x})", 
+                   std::str::from_utf8(&a.word).unwrap_or("<>"), a.code, a_rev,
+                   std::str::from_utf8(&b.word).unwrap_or("<>"), b.code, b_rev);
+            a_rev.cmp(&b_rev)  // Ascending order, not descending!
         } else {
             a.uses.cmp(&b.uses)
         }
     });
     
     for p in &pattern_list {
+        debug!(" Writing pattern to dict: word={:?}, depth={}, len={}", 
+            std::str::from_utf8(&p.word).unwrap_or("<non-utf8>"),
+            p.depth,
+            p.word.len());
         let ns = put_uvarint(&mut num_buf, p.depth as u64);
         cw.write_all(&num_buf[..ns])?;
         let n = put_uvarint(&mut num_buf, p.word.len() as u64);
@@ -544,18 +650,23 @@ pub fn compress_with_pattern_candidates(
         let p = Position {
             pos: *pos,
             uses: *uses,
-            code: *pos,
+            code: *pos,  // Match Go's behavior - use position as initial code for sorting
             code_bits: 0,
             depth: 0,
         };
         position_list.push(p.clone());
         pos2code.insert(*pos, p);
     }
+    debug!(" Position map has {} entries", pos_map.len());
+    debug!(" pos2code contents:");
+    for (pos, code) in &pos2code {
+        debug!("   pos {} -> code {} (bits: {})", pos, code.code, code.code_bits);
+    }
     
     // Sort positions by usage for Huffman tree
     position_list.sort_by(|a, b| {
         if a.uses == b.uses {
-            b.code.reverse_bits().cmp(&a.code.reverse_bits())
+            a.code.reverse_bits().cmp(&b.code.reverse_bits())  // Ascending order like Go
         } else {
             a.uses.cmp(&b.uses)
         }
@@ -609,6 +720,40 @@ pub fn compress_with_pattern_candidates(
     if pos_heap.len() > 0 {
         let mut pos_root = pos_heap.pop().unwrap();
         pos_root.set_depth(0);
+        
+        // Collect all positions from the Huffman tree to update pos2code
+        let mut huffman_positions = Vec::new();
+        pos_root.collect_positions(&mut huffman_positions);
+        
+        debug!(" Positions collected from Huffman tree:");
+        for (i, p) in huffman_positions.iter().enumerate() {
+            eprintln!("  [{}] pos={}, code={}, bits={}, depth={}, uses={}", 
+                i, p.pos, p.code, p.code_bits, p.depth, p.uses);
+        }
+        
+        // Update pos2code and position_list with values from Huffman tree
+        // IMPORTANT: In Go, the tree nodes contain pointers to the original Position objects,
+        // so SetDepth modifies the original positionList. We need to replicate this.
+        for hp in &huffman_positions {
+            // Update the pos2code map
+            pos2code.insert(hp.pos, hp.clone());
+            
+            // Update the original position_list with ALL values from the tree
+            for p in &mut position_list {
+                if p.pos == hp.pos {
+                    p.code = hp.code;
+                    p.code_bits = hp.code_bits;
+                    p.depth = hp.depth;
+                    p.uses = hp.uses;  // SetDepth sets uses=0 in Go
+                    break;
+                }
+            }
+        }
+    }
+    
+    debug!(" pos2code after Huffman update:");
+    for (pos, code) in &pos2code {
+        debug!("   pos {} -> code {} (bits: {})", pos, code.code, code.code_bits);
     }
     
     // Calculate position dictionary size
@@ -625,15 +770,32 @@ pub fn compress_with_pattern_candidates(
     cw.write_all(&num_buf[..8])?;
     
     // Write position dictionary
+    debug!(" Position list before sorting for writing:");
+    for (i, p) in position_list.iter().enumerate() {
+        eprintln!("  [{}] pos={}, code={}, bits={}, depth={}, uses={}", 
+            i, p.pos, p.code, p.code_bits, p.depth, p.uses);
+    }
+    
+    // Match Go's positionListCmp function EXACTLY - sort by uses then reverse code
+    // Go does this same sort twice: once before building tree, once before writing
     position_list.sort_by(|a, b| {
-        if a.depth == b.depth {
-            a.code.cmp(&b.code)
+        if a.uses == b.uses {
+            // Compare reverse of codes (like Go's bits.Reverse64)  
+            a.code.reverse_bits().cmp(&b.code.reverse_bits())
         } else {
-            a.depth.cmp(&b.depth)
+            a.uses.cmp(&b.uses)
         }
     });
     
-    for p in &position_list {
+    debug!(" Position list after sorting for writing:");
+    for (i, p) in position_list.iter().enumerate() {
+        eprintln!("  [{}] pos={}, code={}, bits={}, depth={}, uses={}", 
+            i, p.pos, p.code, p.code_bits, p.depth, p.uses);
+    }
+    
+    for (idx, p) in position_list.iter().enumerate() {
+        debug!(" Writing position[{}] to dict: pos={}, code={}, bits={}, depth={}", 
+            idx, p.pos, p.code, p.code_bits, p.depth);
         let ns = put_uvarint(&mut num_buf, p.depth as u64);
         cw.write_all(&num_buf[..ns])?;
         let n = put_uvarint(&mut num_buf, p.pos);
@@ -642,46 +804,74 @@ pub fn compress_with_pattern_candidates(
     
     // Re-open intermediate file for reading
     // Note: intermediate_file was already moved into BufWriter, so just open fresh
+    debug!(" Reopening intermediate file for reading: {:?}", intermediate_path);
     let intermediate_file = File::open(&intermediate_path)?;
+    debug!(" Intermediate file reopened successfully");
     let mut r = BufReader::with_capacity(2 * 8192 * 1024, intermediate_file);
     
     // Process intermediate file and write final compressed data
     let mut compressed_buffer = Vec::new();
+    let mut hc = BitWriter::new(&mut compressed_buffer);
     
     loop {
         let l = match read_uvarint(&mut r) {
-            Ok(v) => v,
+            Ok(v) => {
+                debug!(" Read word length {} from intermediate file", v);
+                v
+            },
             Err(_) => break,
         };
         
-        let mut word_buffer = Vec::new();
-        let mut hc = BitWriter::new(&mut word_buffer);
-        
         let pos_code = pos2code.get(&(l + 1));
         if let Some(pos_code) = pos_code {
+            debug!(" Encoding word length position code: {} bits: {}", pos_code.code, pos_code.code_bits);
             hc.encode(pos_code.code, pos_code.code_bits as i32)?;
+        } else {
+            debug!(" No position code for word length {}", l + 1);
         }
         
         if l == 0 {
-            hc.flush()?;
-            compressed_buffer.extend_from_slice(&word_buffer);
+            debug!(" Empty word");
+            // Write terminator position (0)
+            let pos_code = pos2code.get(&0);
+            if let Some(pos_code) = pos_code {
+                debug!(" Encoding terminator position code: {} bits: {}", pos_code.code, pos_code.code_bits);
+                hc.encode(pos_code.code, pos_code.code_bits as i32)?;
+            }
         } else {
             let p_num = read_uvarint(&mut r)?;
+            debug!(" Word has {} patterns", p_num);
             let mut last_pos = 0u64;
             let mut last_uncovered = 0i32;
             let mut uncovered_count = 0i32;
             
             for _ in 0..p_num {
                 let pos = read_uvarint(&mut r)?;
-                let pos_code = pos2code.get(&(pos - last_pos + 1));
+                // First position is absolute (pos+1), subsequent are relative
+                let pos_to_encode = if last_pos == 0 { pos + 1 } else { pos - last_pos + 1 };
+                debug!(" Pattern at pos={}, last_pos={}, encoding position={}", 
+                         pos, last_pos, pos_to_encode);
+                let pos_code = pos2code.get(&pos_to_encode);
                 last_pos = pos;
                 
                 if let Some(pos_code) = pos_code {
+                    debug!(" Found position code: {} bits: {}", pos_code.code, pos_code.code_bits);
                     hc.encode(pos_code.code, pos_code.code_bits as i32)?;
+                } else {
+                    debug!(" WARNING: No position code found for relative_pos={}", relative_pos);
                 }
                 
-                let code = read_uvarint(&mut r)?;
-                let pattern_code = &code2pattern[code as usize];
+                let code_index = read_uvarint(&mut r)?;
+                debug!(" Pattern code index: {}", code_index);
+                // code_index is the original index in code2pattern (0="long", 1="longer", 2="word")
+                // We need to find the pattern with the matching word
+                let orig_pattern = &code2pattern[code_index as usize];
+                debug!("Original pattern for index {}: {:?}", code_index, 
+                       std::str::from_utf8(&orig_pattern.word).unwrap_or("<non-utf8>"));
+                let pattern_code = pattern_list.iter()
+                    .find(|p| p.word == orig_pattern.word)
+                    .ok_or_else(|| Error::InvalidFormat(format!("Pattern not found for index {}", code_index)))?;
+                debug!("Found pattern code: {} bits: {}", pattern_code.code, pattern_code.code_bits);
                 
                 if pos as i32 > last_uncovered {
                     uncovered_count += pos as i32 - last_uncovered;
@@ -700,23 +890,35 @@ pub fn compress_with_pattern_candidates(
                 hc.encode(pos_code.code, pos_code.code_bits as i32)?;
             }
             
-            hc.flush()?;
-            compressed_buffer.extend_from_slice(&word_buffer);
+            // Don't flush yet - keep the bit stream continuous
             
             if uncovered_count > 0 {
+                // We need to flush before writing uncovered bytes
+                hc.flush()?;
+                debug!(" Reading {} uncovered bytes", uncovered_count);
                 let mut buf = vec![0u8; uncovered_count as usize];
                 r.read_exact(&mut buf)?;
+                debug!(" Uncovered bytes: {:?}", buf);
                 compressed_buffer.extend_from_slice(&buf);
+                // Create a new BitWriter after writing raw bytes
+                hc = BitWriter::new(&mut compressed_buffer);
             }
         }
     }
     
+    // Final flush at the end
+    hc.flush()?;
+    
     // Write all compressed data
+    debug!(" Writing {} bytes of compressed data", compressed_buffer.len());
+    debug!(" Compressed data: {:?}", compressed_buffer);
     cw.write_all(&compressed_buffer)?;
     cw.flush()?;
     
     // Clean up intermediate file
+    debug!(" Removing intermediate file: {:?}", intermediate_path);
     std::fs::remove_file(&intermediate_path)?;
+    debug!(" Intermediate file removed successfully");
     
     Ok(())
 }

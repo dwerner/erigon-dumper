@@ -9,6 +9,9 @@ use std::path::Path;
 // func TestCompressEmptyDict(t *testing.T) {
 #[test]
 fn test_compress_empty_dict() {
+    // Initialize logger for debug output
+    let _ = env_logger::builder().is_test(true).try_init();
+    
     // logger := log.New()
     // Note: We don't have logging in Rust tests by default
     
@@ -86,6 +89,9 @@ fn test_compress_empty_dict() {
 // ========== Port of a simple pattern test ==========
 #[test]
 fn test_compress_with_dict() {
+    // Initialize logger for debug output
+    let _ = env_logger::builder().is_test(true).try_init();
+    
     // Create a test similar to Go but simpler
     let tmp_dir = TempDir::new().unwrap();
     let file = tmp_dir.path().join("compressed");
