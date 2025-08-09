@@ -20,7 +20,12 @@ thiserror = "2.0"
 tracing = "0.1"
 log = "0.4"
 
-# Temp files (used in tests)
+# Compression dependencies
+bitvec = "1.0"
+suffix = "1.3"
+radix_trie = "0.2"
+
+# Temp files (used in tests and ETL)
 tempfile = "3.14"
 
 # Hex encoding for display
