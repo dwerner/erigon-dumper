@@ -1,6 +1,7 @@
 // Port of Erigon's compress.go
 // Original: go/src/compress.go
 
+use crate::error::CompressionError;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
@@ -11,21 +12,21 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct Cfg {
     pub min_pattern_score: u64,
-    
+
     // minPatternLen is minimum length of pattern we consider to be included into the dictionary
     pub min_pattern_len: usize,
     pub max_pattern_len: usize,
-    
+
     // maxDictPatterns is the maximum number of patterns allowed in the initial (not reduced dictionary)
     // Large values increase memory consumption of dictionary reduction phase
     pub max_dict_patterns: usize,
-    
+
     // DictReducerSoftLimit - Before creating dict of size MaxDictPatterns - need order patterns by score, but with limited RAM usage.
     pub dict_reducer_soft_limit: usize,
-    
+
     // samplingFactor - skip superstrings if `superstringNumber % samplingFactor != 0`
     pub sampling_factor: u64,
-    
+
     pub workers: usize,
 }
 
@@ -47,12 +48,12 @@ impl Default for Cfg {
 // From Go: Pattern struct
 #[derive(Debug, Clone)]
 pub struct Pattern {
-    pub word: Vec<u8>,      // Pattern characters
-    pub score: u64,          // Score assigned to the pattern during dictionary building
-    pub uses: u64,           // How many times this pattern has been used during search and optimisation
-    pub code: u64,           // Allocated numerical code
-    pub code_bits: usize,   // Number of bits in the code
-    pub depth: usize,        // Depth of the pattern in the huffman tree (for encoding in the file)
+    pub word: Vec<u8>,    // Pattern characters
+    pub score: u64,       // Score assigned to the pattern during dictionary building
+    pub uses: u64, // How many times this pattern has been used during search and optimisation
+    pub code: u64, // Allocated numerical code
+    pub code_bits: usize, // Number of bits in the code
+    pub depth: usize, // Depth of the pattern in the huffman tree (for encoding in the file)
 }
 
 impl Pattern {
@@ -102,7 +103,7 @@ impl Eq for Pattern {}
 // From Go: DictionaryBuilder struct
 pub struct DictionaryBuilder {
     last_word: Vec<u8>,
-    items: BinaryHeap<Pattern>,  // Using BinaryHeap instead of slice for heap operations
+    items: BinaryHeap<Pattern>, // Using BinaryHeap instead of slice for heap operations
     soft_limit: usize,
     last_word_score: u64,
 }
@@ -177,47 +178,291 @@ impl DictionaryBuilder {
         self.items.clear();
         self.last_word.clear();
     }
+
+    // From Go: Sort method
+    pub fn sort(&mut self) {
+        // Go: compress.go:345
+        // BinaryHeap already maintains heap order during insertion
+        // The ForEach method handles sorted iteration
+    }
 }
+
+// From Go: compress.go:313
+const SUPERSTRING_LIMIT: usize = 16 * 1024 * 1024;
+
+// From Go: CompressionRatio type
+pub type CompressionRatio = f64;
 
 // From Go: Compressor struct
 pub struct Compressor {
     cfg: Cfg,
     output_file: String,
-    file_name: String,  // File where to output the dictionary and compressed data
-    tmp_dir: String,    // temporary directory to use for ETL when building dictionary
+    file_name: String, // File where to output the dictionary and compressed data
+    tmp_dir: String,   // temporary directory to use for ETL when building dictionary
     log_prefix: String,
-    
-    // Using channels would require async in Rust, we'll use different approach for now
-    // superstrings: Option<Sender<Vec<u8>>>,
-    // uncompressed_file: Option<RawWordsFile>,
+
+    // From Go: compress.go:105-116
+    superstrings: Vec<Vec<u8>>, // Collecting superstrings instead of using channels for now
+    uncompressed_file: Option<RawWordsFile>,
     tmp_out_file_path: String,
-    
+
+    // Buffer for "superstring" - transformation where each byte of a word, say b,
+    // is turned into 2 bytes, 0x01 and b, and two zero bytes 0x00 0x00 are inserted after each word
+    // Go: compress.go:109-113
+    superstring: Vec<u8>,
+    words_count: u64,
+    superstring_count: u64,
+    superstring_len: usize,
+
+    // Compression ratio after compression
+    ratio: CompressionRatio,
+    no_fsync: bool,
+
     // Go uses sync.WaitGroup, we'll use different synchronization when needed
     // wg: Arc<WaitGroup>,
-    
+
     // suffixCollectors: Vec<etl::Collector>,
     lvl: log::Level,
     trace: bool,
 }
 
 impl Compressor {
-    pub fn new(cfg: Cfg, output_file: String, tmp_dir: String, log_prefix: String, lvl: log::Level) -> Self {
-        let file_name = PathBuf::from(&output_file)
+    pub fn new(
+        cfg: Cfg,
+        output_file: String,
+        tmp_dir: String,
+        log_prefix: String,
+        lvl: log::Level,
+    ) -> std::result::Result<Self, CompressionError> {
+        // Go: compress.go:127-131
+        let path = PathBuf::from(&output_file);
+        let file_name = path
             .file_name()
-            .unwrap()
+            .ok_or_else(|| CompressionError::Other("Invalid output file path".to_string()))?
             .to_string_lossy()
             .to_string();
-        
-        Compressor {
+
+        // tmpOutFilePath is a ".seg.tmp" file which will be renamed to ".seg" if everything succeeds
+        let tmp_out_file_path = format!("{}.tmp", output_file);
+
+        // Create uncompressed file path
+        // Go: compress.go:133
+        let uncompressed_path = PathBuf::from(&tmp_dir)
+            .join(&file_name)
+            .with_extension("idt");
+
+        // Go: compress.go:134-137
+        let uncompressed_file = RawWordsFile::new(uncompressed_path.to_string_lossy().to_string())?;
+
+        Ok(Compressor {
             cfg,
-            output_file: output_file.clone(),
+            output_file,
             file_name,
             tmp_dir,
             log_prefix,
-            tmp_out_file_path: String::new(),
+            superstrings: Vec::new(),
+            uncompressed_file: Some(uncompressed_file),
+            tmp_out_file_path,
+            superstring: Vec::with_capacity(1024 * 1024),
+            words_count: 0,
+            superstring_count: 0,
+            superstring_len: 0,
+            ratio: 0.0,
+            no_fsync: false,
             lvl,
             trace: false,
+        })
+    }
+
+    // From Go: compress.go:182
+    pub fn count(&self) -> u64 {
+        self.words_count
+    }
+
+    // From Go: AddWord method - compress.go:195-222
+    pub fn add_word(&mut self, word: &[u8]) -> std::result::Result<(), CompressionError> {
+        self.words_count += 1;
+
+        // Calculate length: 2*len(word) + 2 for the encoding
+        let l = 2 * word.len() + 2;
+
+        // Check if we need to start a new superstring
+        if self.superstring_len + l > SUPERSTRING_LIMIT {
+            // Go: compress.go:205-210
+            if self.superstring_count % self.cfg.sampling_factor == 0 {
+                // Save current superstring
+                let ss = std::mem::replace(&mut self.superstring, Vec::with_capacity(1024 * 1024));
+                self.superstrings.push(ss);
+            }
+            self.superstring_count += 1;
+            self.superstring_len = 0;
         }
+
+        self.superstring_len += l;
+
+        // Only add to superstring if we're sampling this one
+        // Go: compress.go:214-221
+        if self.superstring_count % self.cfg.sampling_factor == 0 {
+            for &byte in word {
+                self.superstring.push(0x01);
+                self.superstring.push(byte);
+            }
+            self.superstring.push(0x00);
+            self.superstring.push(0x00);
+        }
+
+        Ok(())
+    }
+
+    // From Go: AddUncompressedWord - compress.go:224-233
+    pub fn add_uncompressed_word(
+        &mut self,
+        word: &[u8],
+    ) -> std::result::Result<(), CompressionError> {
+        self.words_count += 1;
+
+        if let Some(ref mut file) = self.uncompressed_file {
+            file.append_uncompressed(word)?;
+            Ok(())
+        } else {
+            Err(CompressionError::Other(
+                "Uncompressed file not initialized".to_string(),
+            ))
+        }
+    }
+
+    // From Go: DisableFsync - compress.go:294
+    pub fn disable_fsync(&mut self) {
+        self.no_fsync = true;
+    }
+
+    // From Go: Ratio getter
+    pub fn ratio(&self) -> CompressionRatio {
+        self.ratio
+    }
+
+    // From Go: fsync - compress.go:299-308
+    fn fsync(&self, file: &File) -> std::result::Result<(), CompressionError> {
+        if self.no_fsync {
+            return Ok(());
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+
+    // From Go: Compress - compress.go:235-292
+    pub fn compress(&mut self) -> std::result::Result<(), CompressionError> {
+        use std::fs;
+        use std::time::Instant;
+
+        let start = Instant::now();
+
+        // Go: compress.go:236-238
+        if let Some(ref mut uf) = self.uncompressed_file {
+            uf.flush()?;
+        }
+
+        // Go: compress.go:242-244
+        if !self.superstring.is_empty() {
+            let ss = std::mem::take(&mut self.superstring);
+            self.superstrings.push(ss);
+        }
+
+        // Build dictionary from collected superstrings
+        // Go: compress.go:251
+        let mut dict_builder = self.build_dictionary()?;
+
+        // Save dictionary for debugging if trace is enabled
+        // Go: compress.go:255-260
+        if self.trace {
+            let dict_path = PathBuf::from(&self.tmp_dir)
+                .join(&self.file_name)
+                .with_extension("dictionary.txt");
+            persist_dictionary(&dict_path, &dict_builder)?;
+        }
+
+        // Create compressed file
+        // Go: compress.go:263-267
+        let cf = File::create(&self.tmp_out_file_path).map_err(|e| CompressionError::FileCreate {
+            path: self.tmp_out_file_path.clone(),
+            source: e,
+        })?;
+
+        // Compress with pattern candidates
+        // Go: compress.go:269-271
+        if let Some(ref mut uf) = self.uncompressed_file {
+            crate::parallel_compress::compress_with_pattern_candidates(
+                self.trace,
+                &self.cfg,
+                &self.log_prefix,
+                &self.tmp_out_file_path,
+                &mut cf.try_clone()?,
+                uf,
+                &dict_builder,
+            )?;
+        }
+
+        // Sync and close file
+        // Go: compress.go:272-277
+        self.fsync(&cf)?;
+        drop(cf);
+
+        // Rename temp file to final output
+        // Go: compress.go:278-280
+        fs::rename(&self.tmp_out_file_path, &self.output_file).map_err(|e| {
+            CompressionError::FileRename {
+                from: self.tmp_out_file_path.clone(),
+                to: self.output_file.clone(),
+                source: e,
+            }
+        })?;
+
+        // Calculate compression ratio
+        // Go: compress.go:282-285
+        if let Some(ref uf) = self.uncompressed_file {
+            self.ratio = calculate_ratio(&uf.file_path, &self.output_file)?;
+        }
+
+        // Log completion
+        // Go: compress.go:287-290
+        if self.lvl <= log::Level::Trace {
+            log::trace!(
+                "[{}] Compress took {:?}, ratio: {:.2}, file: {}",
+                self.log_prefix,
+                start.elapsed(),
+                self.ratio,
+                self.file_name
+            );
+        }
+
+        Ok(())
+    }
+
+    // Build dictionary from superstrings
+    fn build_dictionary(&mut self) -> std::result::Result<DictionaryBuilder, CompressionError> {
+        // Go: parallel_compress.go:916-947
+        // This is a simplified version without ETL collectors
+        
+        let mut dict_builder = DictionaryBuilder::new(self.cfg.dict_reducer_soft_limit);
+        
+        // Extract patterns from all superstrings
+        let patterns = crate::parallel_compress::extract_patterns_in_superstrings(
+            self.superstrings.clone(),
+            &self.cfg,
+        );
+        
+        // Add patterns to dictionary builder
+        for pattern in patterns {
+            dict_builder.process_word(pattern.word, pattern.score);
+        }
+        
+        // Finish with hard limit
+        dict_builder.finish(self.cfg.max_dict_patterns);
+        
+        // Sort patterns
+        dict_builder.sort();
+        
+        Ok(dict_builder)
     }
 }
 
@@ -254,10 +499,16 @@ impl DictAggregator {
     }
 
     // From Go: processWord method
-    pub fn process_word(&mut self, word: Vec<u8>, score: u64) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn process_word(
+        &mut self,
+        _word: Vec<u8>,
+        _score: u64,
+    ) -> std::result::Result<(), CompressionError> {
         // Go: compress.go:768-773
         // Will implement when we have ETL collector
-        unimplemented!()
+        Err(CompressionError::NotImplemented(
+            "DictAggregator::process_word".to_string(),
+        ))
     }
 }
 
@@ -265,27 +516,130 @@ impl DictAggregator {
 pub struct RawWordsFile {
     f: File,
     w: BufWriter<File>,
-    file_path: String,
-    buf: Vec<u8>,
-    count: u64,
+    pub file_path: String,
+    buf: [u8; 10], // Buffer for varint encoding
+    pub count: u64,
 }
 
 impl RawWordsFile {
-    pub fn new(file_path: String) -> Result<Self, std::io::Error> {
+    pub fn new(file_path: String) -> std::result::Result<Self, CompressionError> {
         // Go: compress.go:833-841
-        let f = File::create(&file_path)?;
+        let f = File::create(&file_path).map_err(|e| CompressionError::FileCreate {
+            path: file_path.clone(),
+            source: e,
+        })?;
         let w = BufWriter::new(f.try_clone()?);
-        
+
         Ok(RawWordsFile {
             f,
             w,
             file_path,
-            buf: Vec::new(),
+            buf: [0; 10],
             count: 0,
         })
     }
 
-    // Will implement Write, Flush, Close methods when needed
+    // From Go: Append - compress.go:860-872
+    pub fn append(&mut self, v: &[u8]) -> std::result::Result<(), CompressionError> {
+        self.count += 1;
+        // For compressed words, the length prefix is shifted to make lowest bit zero
+        let n = encode_varint(&mut self.buf, 2 * v.len() as u64);
+        self.w.write_all(&self.buf[..n])?;
+        if !v.is_empty() {
+            self.w.write_all(v)?;
+        }
+        Ok(())
+    }
+
+    // From Go: AppendUncompressed - compress.go:874-887
+    pub fn append_uncompressed(&mut self, v: &[u8]) -> std::result::Result<(), CompressionError> {
+        self.count += 1;
+        // For uncompressed words, the length prefix is shifted to make lowest bit one
+        let n = encode_varint(&mut self.buf, 2 * v.len() as u64 + 1);
+        self.w.write_all(&self.buf[..n])?;
+        if !v.is_empty() {
+            self.w.write_all(v)?;
+        }
+        Ok(())
+    }
+
+    // From Go: Flush - compress.go:849-851
+    pub fn flush(&mut self) -> std::result::Result<(), CompressionError> {
+        self.w.flush()?;
+        Ok(())
+    }
+
+    // From Go: Close - compress.go:852-855
+    pub fn close(mut self) -> std::result::Result<(), CompressionError> {
+        self.w.flush()?;
+        // File is closed when dropped
+        Ok(())
+    }
+
+    // From Go: CloseAndRemove - compress.go:856-859
+    pub fn close_and_remove(mut self) -> std::result::Result<(), CompressionError> {
+        self.w.flush()?;
+        drop(self.w);
+        drop(self.f);
+        std::fs::remove_file(&self.file_path)?;
+        Ok(())
+    }
+
+    // From Go: ForEach - compress.go:889-917
+    pub fn for_each<F>(&mut self, mut walker: F) -> std::result::Result<(), CompressionError>
+    where
+        F: FnMut(&[u8], bool) -> std::result::Result<(), CompressionError>,
+    {
+        use std::io::{BufReader, Read, Seek};
+        
+        // Seek to beginning
+        self.f.seek(std::io::SeekFrom::Start(0))?;
+        
+        let mut reader = BufReader::new(&self.f);
+        let mut buf = vec![0u8; 16 * 1024];
+        
+        loop {
+            // Read varint length
+            let mut l = 0u64;
+            let mut shift = 0;
+            loop {
+                let mut byte = [0u8; 1];
+                if reader.read_exact(&mut byte).is_err() {
+                    // EOF
+                    return Ok(());
+                }
+                l |= ((byte[0] & 0x7F) as u64) << shift;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            
+            // Extract lowest bit as "uncompressed" flag
+            let compressed = (l & 1) == 0;
+            l >>= 1;
+            
+            // Read word bytes
+            if buf.len() < l as usize {
+                buf.resize(l as usize, 0);
+            }
+            reader.read_exact(&mut buf[..l as usize])?;
+            
+            walker(&buf[..l as usize], compressed)?;
+        }
+    }
+}
+
+// Helper function to encode varint (like Go's binary.PutUvarint)
+fn encode_varint(buf: &mut [u8], mut x: u64) -> usize {
+    let mut i = 0;
+    while x >= 0x80 {
+        buf[i] = (x as u8) | 0x80;
+        x >>= 7;
+        i += 1;
+    }
+    buf[i] = x as u8;
+    i + 1
 }
 
 // From Go: Position struct (from compress.go)
@@ -295,7 +649,7 @@ pub struct Position {
     pub pos: u64,
     pub code: u64,
     pub code_bits: usize,
-    pub depth: usize,  // Depth of the position in the huffman tree
+    pub depth: usize, // Depth of the position in the huffman tree
 }
 
 // From Go: PatternHuff struct (for Huffman tree)
@@ -325,7 +679,7 @@ pub struct DynamicCell {
     pub cover_start: usize,
     pub compression: usize,
     pub score: u64,
-    pub pattern_idx: usize,  // offset of the last element in the pattern slice
+    pub pattern_idx: usize, // offset of the last element in the pattern slice
 }
 
 // From Go: Ring struct (from compress.go)
@@ -340,19 +694,22 @@ impl Ring {
     pub fn new() -> Self {
         // Go: compress.go:691-697
         Ring {
-            cells: vec![DynamicCell {
-                optim_start: 0,
-                cover_start: 0,
-                compression: 0,
-                score: 0,
-                pattern_idx: 0,
-            }; 16],
+            cells: vec![
+                DynamicCell {
+                    optim_start: 0,
+                    cover_start: 0,
+                    compression: 0,
+                    score: 0,
+                    pattern_idx: 0,
+                };
+                16
+            ],
             head: 0,
             tail: 0,
             count: 0,
         }
     }
-    
+
     // Will implement PushFront, PushBack, Get methods when needed
 }
 
@@ -373,7 +730,11 @@ impl BitWriter {
     }
 
     // From Go: encode method
-    pub fn encode(&mut self, mut code: u64, mut code_bits: usize) -> Result<(), std::io::Error> {
+    pub fn encode(
+        &mut self,
+        mut code: u64,
+        mut code_bits: usize,
+    ) -> std::result::Result<(), std::io::Error> {
         // Go: compress.go:642-659
         while code_bits > 0 {
             let bits_used = if self.output_bits + code_bits > 8 {
@@ -381,13 +742,13 @@ impl BitWriter {
             } else {
                 code_bits
             };
-            
+
             let mask = (1u64 << bits_used) - 1;
             self.output_byte |= ((code & mask) << self.output_bits) as u8;
             code >>= bits_used;
             code_bits -= bits_used;
             self.output_bits += bits_used;
-            
+
             if self.output_bits == 8 {
                 self.w.write_all(&[self.output_byte])?;
                 self.output_bits = 0;
@@ -398,6 +759,31 @@ impl BitWriter {
     }
 
     // Will implement flush and other methods when needed
+}
+
+// Helper functions
+
+// From Go: persistDictionary - compress.go
+fn persist_dictionary(path: &std::path::Path, dict: &DictionaryBuilder) -> std::result::Result<(), CompressionError> {
+    use std::fs::File;
+    use std::io::Write;
+    
+    let mut file = File::create(path)?;
+    dict.for_each(|score, word| {
+        writeln!(file, "{}: {:?}", score, String::from_utf8_lossy(word)).ok();
+    });
+    Ok(())
+}
+
+// From Go: calculateRatio - compress.go
+fn calculate_ratio(uncompressed_path: &str, compressed_path: &str) -> std::result::Result<CompressionRatio, CompressionError> {
+    use std::fs;
+    
+    let uncompressed_meta = fs::metadata(uncompressed_path)?;
+    let compressed_meta = fs::metadata(compressed_path)?;
+    
+    let ratio = uncompressed_meta.len() as f64 / compressed_meta.len() as f64;
+    Ok(ratio)
 }
 
 // Include test module
