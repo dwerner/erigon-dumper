@@ -1,0 +1,21 @@
+[package]
+name = "erigon-dumper-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+erigon-dumper = { path = ".." }
+tempfile = "3.8"
+log = "0.4"
+env_logger = "0.10"
+
+[[bin]]
+name = "fuzz_compress"
+path = "fuzz_targets/fuzz_compress.rs"
+test = false
+doc = false

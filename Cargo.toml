@@ -37,3 +37,5 @@ criterion = "0.5"
 smol-potat = "1.1"  # Minimal async runtime for tests
 crc32fast = "1.4"  # For checksum tests matching Go
 env_logger = "0.10"  # For test logging
+proptest = "1.4"  # Property-based testing
+rand = "0.8"  # Random number generation for tests
