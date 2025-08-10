@@ -824,7 +824,29 @@ fn parse_position_dictionary(data: &[u8]) -> Result<PosTable, CompressionError> 
 
 // Build pattern table from huffman tree data
 fn build_pattern_table(huffs: &[(u64, Vec<Vec<u8>>)]) -> Result<PatternTable, CompressionError> {
-    let mut table = PatternTable::new(9);
+    // Find the maximum depth to determine bit_len
+    let max_depth = huffs.iter().map(|(depth, _)| *depth).max().unwrap_or(0);
+    
+    // Use maximum depth as bit_len, with minimum of 9  
+    let bit_len = (max_depth as usize).max(9);
+    
+    // Calculate total patterns to estimate maximum code
+    let total_patterns: usize = huffs.iter().map(|(_, patterns)| patterns.len()).sum();
+    
+    // Use larger bit_len to accommodate potential code spreading
+    let safe_bit_len = if total_patterns > 0 {
+        // Ensure we have enough space for code + (1 << bit_len)
+        let max_code_estimate = total_patterns;
+        let required_bits = ((max_code_estimate + (1 << bit_len)) as f64).log2().ceil() as usize;
+        required_bits.max(bit_len)
+    } else {
+        bit_len
+    };
+    
+    log::debug!("Building pattern table: max_depth={}, bit_len={}, safe_bit_len={}, table_size={}", 
+        max_depth, bit_len, safe_bit_len, 1 << safe_bit_len);
+    
+    let mut table = PatternTable::new(safe_bit_len);
 
     // Build huffman codes for each depth level
     let mut code = 0u16;
@@ -837,6 +859,8 @@ fn build_pattern_table(huffs: &[(u64, Vec<Vec<u8>>)]) -> Result<PatternTable, Co
                 code,
                 len: *depth as u8,
             };
+            log::debug!("Inserting pattern code={}, len={}, pattern={:?}", 
+                code, *depth, String::from_utf8_lossy(pattern));
             table.insert_word(cw);
             code += 1;
         }

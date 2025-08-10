@@ -280,6 +280,10 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
     // Test for multiple words with patterns
     #[test]
     fn test_compress_decompress_with_patterns() {
+        // Initialize logger for debugging
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .try_init();
         let tmp_dir = TempDir::new().unwrap();
         let file_path = tmp_dir.path().join("patterns");
 

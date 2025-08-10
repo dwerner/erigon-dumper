@@ -5,8 +5,13 @@ mod tests {
     use erigon_dumper::compress::{Cfg, Compressor};
     use tempfile::TempDir;
 
-    #[test]
+    #[test] 
     fn test_compression_with_patterns() {
+        // Initialize logger for debugging
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .try_init();
+            
         let tmp_dir = TempDir::new().unwrap();
         let output_file = tmp_dir.path().join("test.seg");
 
@@ -25,19 +30,14 @@ mod tests {
         )
         .unwrap();
 
-        // Add words with repeating patterns
-        // "test" appears multiple times
+        // Add the full original set to reproduce the error
         compressor.add_word(b"test").unwrap();
         compressor.add_word(b"testing").unwrap();
         compressor.add_word(b"test123").unwrap();
         compressor.add_word(b"mytest").unwrap();
-
-        // "hello" appears multiple times
         compressor.add_word(b"hello").unwrap();
         compressor.add_word(b"helloworld").unwrap();
         compressor.add_word(b"hello123").unwrap();
-
-        // Some unique words
         compressor.add_word(b"unique").unwrap();
         compressor.add_word(b"another").unwrap();
 
