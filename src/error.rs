@@ -17,6 +17,14 @@ pub enum CompressionError {
         #[source]
         source: io::Error,
     },
+    
+    #[error("Failed to open file: {path}: {source}")]
+    FileOpen {
+        // REVIEW: pathbuf?
+        path: String,
+        #[source]
+        source: io::Error,
+    },
 
     #[error("Failed to rename file from {from} to {to}: {source}")]
     FileRename {

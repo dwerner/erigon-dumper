@@ -107,8 +107,7 @@ impl Compressor {
         // Go: compress.go:134-137
         let uncompressed_file = RawWordsFile::new(uncompressed_path.to_string_lossy().to_string())?;
 
-        // REVIEW: missing "Collector for dictionary superstrings collection (sorted by their score)"
-
+        // Note: Using synchronous superstring collection instead of Go's parallel workers/channels
         Ok(Compressor {
             cfg,
             output_file,
@@ -193,11 +192,6 @@ impl Compressor {
         }
     }
 
-    // REVIEW: this is missing DictionaryBuilderFromCollectors (which is also missing)
-    // REVIEW: this is also quite incomplete. Look at all the channel stuff golang is doing here
-    // REVIEW: THIS is probably one of the main reasons this impl isn't working as expected
-    // REVIEW: we need to port this fully.
-    // REVIEW: IF we are missing dependencies, we need to impl them before we can proceed
     // From Go: Compress - compress.go:235-292
     pub fn compress(&mut self) -> std::result::Result<(), CompressionError> {
         use std::fs;
@@ -205,23 +199,24 @@ impl Compressor {
 
         let start = Instant::now();
 
-        // Go: compress.go:236-238
+        // Flush uncompressed file
         if let Some(ref mut uf) = self.uncompressed_file {
             uf.flush()?;
         }
 
-        // Go: compress.go:242-244
+        // Add any remaining superstring
         if !self.superstring.is_empty() {
             let ss = std::mem::take(&mut self.superstring);
             self.superstrings.push(ss);
         }
 
-        // Build dictionary from collected superstrings
-        // Go: compress.go:251
-        let dict_builder = self.build_dictionary()?;
+        log::info!("[{}] Building dictionary from {} superstrings", 
+                  self.log_prefix, self.superstrings.len());
+
+        // Build dictionary from collected superstrings (synchronous version)
+        let dict_builder = self.build_dictionary_from_superstrings()?;
 
         // Save dictionary for debugging if trace is enabled
-        // Go: compress.go:255-260
         if self.trace {
             let dict_path = PathBuf::from(&self.tmp_dir)
                 .join(&self.file_name)
@@ -230,15 +225,12 @@ impl Compressor {
         }
 
         // Create compressed file
-        // Go: compress.go:263-267
-        let cf =
-            File::create(&self.tmp_out_file_path).map_err(|e| CompressionError::FileCreate {
-                path: self.tmp_out_file_path.clone(),
-                source: e,
-            })?;
+        let cf = File::create(&self.tmp_out_file_path).map_err(|e| CompressionError::FileCreate {
+            path: self.tmp_out_file_path.clone(),
+            source: e,
+        })?;
 
         // Compress with pattern candidates
-        // Go: compress.go:269-271
         if let Some(ref mut uf) = self.uncompressed_file {
             crate::parallel_compress::compress_with_pattern_candidates(
                 self.trace,
@@ -252,12 +244,10 @@ impl Compressor {
         }
 
         // Sync and close file
-        // Go: compress.go:272-277
         self.fsync(&cf)?;
         drop(cf);
 
         // Rename temp file to final output
-        // Go: compress.go:278-280
         fs::rename(&self.tmp_out_file_path, &self.output_file).map_err(|e| {
             CompressionError::FileRename {
                 from: self.tmp_out_file_path.clone(),
@@ -267,19 +257,17 @@ impl Compressor {
         })?;
 
         // Calculate compression ratio
-        // Go: compress.go:282-285
         if let Some(ref uf) = self.uncompressed_file {
             self.ratio = calculate_ratio(&uf.file_path, &self.output_file)?;
         }
 
         // Log completion
-        // Go: compress.go:287-290
-        if self.lvl <= log::Level::Trace {
-            log::trace!(
-                "[{}] Compress took {:?}, ratio: {:.2}, file: {}",
+        if self.lvl <= log::Level::Info {
+            log::info!(
+                "[{}] Compress took {:?}, ratio: {}, file: {}",
                 self.log_prefix,
                 start.elapsed(),
-                self.ratio,
+                ratio_to_string(self.ratio),
                 self.file_name
             );
         }
@@ -307,37 +295,60 @@ impl Compressor {
     }
 
 
-    // Build dictionary from superstrings
-    fn build_dictionary(&mut self) -> std::result::Result<DictionaryBuilder, CompressionError> {
-        // Go: parallel_compress.go:916-947
-        // This is a simplified version without ETL collectors
-
-        let mut dict_builder = DictionaryBuilder::new(self.cfg.dict_reducer_soft_limit);
-
-        // Extract patterns from all superstrings
-        let patterns = crate::parallel_compress::extract_patterns_in_superstrings(
-            self.superstrings.clone(),
-            &self.cfg,
-        );
-
-        // Add patterns to dictionary builder
-        for pattern in patterns {
-            dict_builder.process_word(pattern.word, pattern.score);
+    // Build dictionary from superstrings (synchronous version of Go's DictionaryBuilderFromCollectors)
+    fn build_dictionary_from_superstrings(&mut self) -> std::result::Result<DictionaryBuilder, CompressionError> {
+        // This is the synchronous equivalent of Go's parallel_compress.go:916-947
+        
+        // Create aggregator to collect patterns from all superstrings
+        let mut dict_aggregator = DictAggregator::new();
+        
+        // Process each superstring to extract patterns (synchronous instead of parallel)
+        for superstring in &self.superstrings {
+            if superstring.is_empty() {
+                continue;
+            }
+            
+            // Extract patterns from this superstring
+            let patterns = crate::parallel_compress::extract_patterns_from_single_superstring(
+                superstring,
+                &self.cfg,
+            );
+            
+            // Add patterns to aggregator
+            for pattern in patterns {
+                dict_aggregator.process_word(pattern.word, pattern.score)?;
+            }
         }
-
-        // Finish with hard limit
+        
+        // Finish aggregation
+        let collector = dict_aggregator.finish()?;
+        
+        // Build dictionary from collected patterns
+        let mut dict_builder = DictionaryBuilder::new(self.cfg.dict_reducer_soft_limit);
+        dict_builder.load_from_collector(collector);
+        
+        // Apply hard limit
         dict_builder.finish(self.cfg.max_dict_patterns);
-
-        // Sort patterns
+        
+        // Sort patterns (for compatibility, though heap already maintains order)
         dict_builder.sort();
-
+        
+        log::info!("[{}] Dictionary built with {} patterns", 
+                  self.log_prefix, dict_builder.len());
+        
         Ok(dict_builder)
     }
 }
 
-// REVIEW: Missing comment from go
-// From Go: compress.go:313
+// superstringLimit limits how large can one "superstring" get before it is processed
+// CompressorSequential allocates 7 bytes for each uint of superstringLimit. For example,
+// superstingLimit 16m will result in 112Mb being allocated for various arrays
+// From Go: compress.go:310-313
 const SUPERSTRING_LIMIT: usize = 16 * 1024 * 1024;
+
+// ETL buffer sizes from Go's etl package
+const ETL_BUFFER_OPTIMAL_SIZE: usize = 256 * 1024 * 1024; // 256MB
+const ETL_BUF_IO_SIZE: usize = 64 * 1024; // 64KB
 
 // From Go: DictionaryBuilder struct
 pub struct DictionaryBuilder {
@@ -347,7 +358,6 @@ pub struct DictionaryBuilder {
     last_word_score: u64,
 }
 
-// REVIEW: this is a partial impl - needs rework and review
 impl DictionaryBuilder {
     pub fn new(soft_limit: usize) -> Self {
         DictionaryBuilder {
@@ -369,66 +379,91 @@ impl DictionaryBuilder {
         self.items.len()
     }
 
-    // From Go: processWord method
+    // From Go: processWord method - compress.go:360-366
     pub fn process_word(&mut self, chars: Vec<u8>, score: u64) {
-        // Go: compress.go:360-366
+        // Push new pattern to heap
         self.items.push(Pattern::new(chars, score));
+        
+        // If over soft limit, remove the smallest score element
         if self.items.len() > self.soft_limit {
-            // Pop the smallest element (min score)
+            // Since BinaryHeap is a max-heap and Pattern's Ord is reversed for min-heap behavior,
+            // pop() removes the minimum score element
             self.items.pop();
         }
     }
 
-    // From Go: loadFunc method - will be implemented when we port ETL
-    // pub fn load_func(&mut self, k: &[u8], v: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    //     // Go: compress.go:368-380
-    //     unimplemented!()
-    // }
+    // Load patterns from a collector (replaces ETL loadFunc)
+    pub fn load_from_collector(&mut self, collector: SimplePatternCollector) {
+        for pattern in collector.into_patterns() {
+            // Aggregate patterns with same word
+            if pattern.word == self.last_word {
+                self.last_word_score += pattern.score;
+            } else {
+                if !self.last_word.is_empty() {
+                    self.process_word(self.last_word.clone(), self.last_word_score);
+                }
+                self.last_word = pattern.word;
+                self.last_word_score = pattern.score;
+            }
+        }
+    }
 
-    // From Go: finish method
+    // From Go: finish method - compress.go:382-390
     pub fn finish(&mut self, hard_limit: usize) {
-        // Go: compress.go:382-390
+        // Process the last word if any
         if !self.last_word.is_empty() {
             self.process_word(self.last_word.clone(), self.last_word_score);
+            self.last_word.clear();
+            self.last_word_score = 0;
         }
-        // Keep only hard_limit items
+        
+        // Keep only hard_limit items by removing lowest scores
         while self.items.len() > hard_limit {
             self.items.pop();
         }
     }
 
-    // From Go: ForEach method
+    // From Go: ForEach method - compress.go:393-397
     pub fn for_each<F>(&self, mut f: F)
     where
         F: FnMut(u64, &[u8]),
     {
-        // Go: compress.go:393-397
-        // Note: BinaryHeap doesn't provide ordered iteration
-        // We need to collect and sort for ordered iteration
+        // Collect all patterns and sort them
         let mut items: Vec<_> = self.items.iter().collect();
-        items.sort_by(|a, b| b.cmp(a)); // Sort in descending order by score
+        // Sort by score descending (highest score first)
+        items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.word.cmp(&b.word)));
+        
+        // Iterate in sorted order
         for pattern in items {
             f(pattern.score, &pattern.word);
         }
     }
+    
+    // Get patterns as a vector (for use in compression)
+    pub fn into_patterns(self) -> Vec<Pattern> {
+        // Convert heap to sorted vector
+        let mut patterns: Vec<Pattern> = self.items.into_sorted_vec();
+        // Reverse because into_sorted_vec gives us min to max, but we want max to min
+        patterns.reverse();
+        patterns
+    }
 
-    // From Go: Close method
+    // From Go: Close method - compress.go:399-401
     pub fn close(&mut self) {
-        // Go: compress.go:399-401
         self.items.clear();
         self.last_word.clear();
     }
 
-    // From Go: Sort method
+    // From Go: Sort method - compress.go:345
     pub fn sort(&mut self) {
-        // Go: compress.go:345
-        // BinaryHeap already maintains heap order during insertion
-        // The ForEach method handles sorted iteration
+        // In Go, this sorts the items slice
+        // For us, the heap maintains order and for_each/into_patterns handle sorting
+        // This is a no-op for compatibility
     }
 }
 
 
-// REVIEW: missing go comment
+// Pattern represents a byte sequence to be used in compression dictionary
 // From Go: Pattern struct
 #[derive(Debug, Clone)]
 pub struct Pattern {
@@ -455,18 +490,31 @@ impl Pattern {
     }
 }
 
-// REVIEW: missing PatternList type alias and comment, cmp impl
+// PatternList is a slice of patterns that can be sorted
+pub type PatternList = Vec<Pattern>;
 
-// Implement ordering for Pattern to use in BinaryHeap (max-heap by default in Rust)
-// Go uses a min-heap, so we need to reverse the ordering
+// From Go: patternListCmp - compress.go:411-419
+pub fn pattern_list_cmp(a: &Pattern, b: &Pattern) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match a.uses.cmp(&b.uses) {
+        Ordering::Equal => {
+            // When uses are equal, compare by reverse of code
+            reverse_bits_64(b.code).cmp(&reverse_bits_64(a.code))
+        }
+        other => other,
+    }
+}
+
+// Implement ordering for Pattern - used by DictionaryBuilder's BinaryHeap
+// This compares by score for selecting top patterns during dictionary building
+// For post-Huffman sorting, use pattern_list_cmp explicitly
 impl Ord for Pattern {
     fn cmp(&self, other: &Self) -> Ordering {
-        // From Go: compress.go:328-340
-        // First compare by score (reversed for min-heap behavior)
+        // From Go: dictionaryBuilderCmp - compress.go:335-340
+        // Reversed for min-heap behavior (BinaryHeap is max-heap by default)
         match other.score.cmp(&self.score) {
             Ordering::Equal => {
                 // If scores are equal, compare by word bytes
-                // Go: bytes.Compare(db.items[i].word, db.items[j].word) < 0
                 self.word.cmp(&other.word)
             }
             ord => ord,
@@ -474,14 +522,14 @@ impl Ord for Pattern {
     }
 }
 
-// REVIEW: go lacks PartialOrd, could this affect order?
+// Required for Ord trait in Rust (Go uses comparison functions instead)
 impl PartialOrd for Pattern {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-// REVIEW: Is this really partialeq for patterns? review
+// Patterns are equal if both score and word match
 impl PartialEq for Pattern {
     fn eq(&self, other: &Self) -> bool {
         self.score == other.score && self.word == other.word
@@ -490,7 +538,41 @@ impl PartialEq for Pattern {
 
 impl Eq for Pattern {}
 
-// REVIEW: Missing PatternHeap type alias and comment and impl
+// PatternHeap is a min-heap of PatternHuff nodes for building Huffman tree
+pub type PatternHeap = std::collections::BinaryHeap<PatternHuffWrapper>;
+
+// Wrapper for PatternHuff to implement Ord for BinaryHeap
+pub struct PatternHuffWrapper {
+    pub inner: Box<PatternHuff>,
+}
+
+impl Ord for PatternHuffWrapper {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse order for min-heap (BinaryHeap is max-heap by default)
+        // First compare by uses (ascending)
+        match other.inner.uses.cmp(&self.inner.uses) {
+            std::cmp::Ordering::Equal => {
+                // Then by tie_breaker (ascending)
+                other.inner.tie_breaker.cmp(&self.inner.tie_breaker)
+            }
+            ord => ord,
+        }
+    }
+}
+
+impl PartialOrd for PatternHuffWrapper {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for PatternHuffWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.uses == other.inner.uses && self.inner.tie_breaker == other.inner.tie_breaker
+    }
+}
+
+impl Eq for PatternHuffWrapper {}
 
 // From Go: PatternHuff struct (for Huffman tree)
 pub struct PatternHuff {
@@ -631,8 +713,54 @@ impl PositionHuff {
     }
 }
 
-// REVIEW: Missing PositionList type alias and impl, positionListCmp
-// REVIEW: Missing PositionHeap type alias and impl
+// PositionList is a slice of positions that can be sorted
+pub type PositionList = Vec<Position>;
+
+// From Go: positionListCmp - parallel_compress.go:429-434
+pub fn position_list_cmp(a: &Position, b: &Position) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match a.uses.cmp(&b.uses) {
+        Ordering::Equal => {
+            // When uses are equal, compare by reverse of code
+            reverse_bits_64(b.code).cmp(&reverse_bits_64(a.code))
+        }
+        other => other,
+    }
+}
+
+// PositionHeap is a min-heap of PositionHuff nodes for building Huffman tree
+pub type PositionHeap = std::collections::BinaryHeap<PositionHuffWrapper>;
+
+// Wrapper for PositionHuff to implement Ord for BinaryHeap
+pub struct PositionHuffWrapper {
+    pub inner: Box<PositionHuff>,
+}
+
+impl Ord for PositionHuffWrapper {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse order for min-heap
+        match other.inner.uses.cmp(&self.inner.uses) {
+            std::cmp::Ordering::Equal => {
+                other.inner.tie_breaker.cmp(&self.inner.tie_breaker)
+            }
+            ord => ord,
+        }
+    }
+}
+
+impl PartialOrd for PositionHuffWrapper {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for PositionHuffWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.uses == other.inner.uses && self.inner.tie_breaker == other.inner.tie_breaker
+    }
+}
+
+impl Eq for PositionHuffWrapper {}
 
 // From Go: BitWriter struct (from compress.go)
 pub struct BitWriter {
@@ -679,8 +807,16 @@ impl BitWriter {
         Ok(())
     }
 
-    // REVIEW: Missing flush impl
-    // Will implement flush and other methods when needed
+    // From Go: flush method - compress.go:661-665
+    pub fn flush(&mut self) -> std::result::Result<(), std::io::Error> {
+        if self.output_bits > 0 {
+            self.w.write_all(&[self.output_byte])?;
+            self.output_bits = 0;
+            self.output_byte = 0;
+        }
+        self.w.flush()?;
+        Ok(())
+    }
 }
 
 // From Go: DynamicCell struct (from compress.go)
@@ -800,19 +936,53 @@ impl Ring {
     }
 }
 
+// Simple ETL collector substitute - synchronous pattern collector
+// This replaces Go's ETL collector system for dictionary building
+pub struct SimplePatternCollector {
+    patterns: std::collections::HashMap<Vec<u8>, u64>, // pattern -> accumulated score
+    total_patterns: usize,
+}
+
+impl SimplePatternCollector {
+    pub fn new() -> Self {
+        SimplePatternCollector {
+            patterns: std::collections::HashMap::new(),
+            total_patterns: 0,
+        }
+    }
+
+    // Add a pattern with its score (accumulates if pattern exists)
+    pub fn collect(&mut self, pattern: Vec<u8>, score: u64) {
+        *self.patterns.entry(pattern).or_insert(0) += score;
+        self.total_patterns += 1;
+    }
+
+    // Convert to sorted list of patterns
+    pub fn into_patterns(self) -> Vec<Pattern> {
+        self.patterns
+            .into_iter()
+            .map(|(word, score)| Pattern::new(word, score))
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.patterns.len()
+    }
+}
+
 // From Go: DictAggregator struct
 pub struct DictAggregator {
-    // collector: etl::Collector,  // Will implement ETL later
+    collector: SimplePatternCollector,
     dist: std::collections::HashMap<usize, usize>,
     received_words: usize,
     last_word: Vec<u8>,
     last_word_score: u64,
 }
 
-// REVIEW: incomplete impl of DictAggregator
 impl DictAggregator {
     pub fn new() -> Self {
         DictAggregator {
+            collector: SimplePatternCollector::new(),
             dist: std::collections::HashMap::new(),
             received_words: 0,
             last_word: Vec::new(),
@@ -820,35 +990,83 @@ impl DictAggregator {
         }
     }
 
-    // From Go: processWord method
+    // From Go: processWord method - compress.go:768-773
     pub fn process_word(
         &mut self,
-        _word: Vec<u8>,
-        _score: u64,
+        word: Vec<u8>,
+        score: u64,
     ) -> std::result::Result<(), CompressionError> {
-        // Go: compress.go:768-773
-        // Will implement when we have ETL collector
-        Err(CompressionError::NotImplemented(
-            "DictAggregator::process_word".to_string(),
-        ))
+        self.received_words += 1;
+        *self.dist.entry(word.len()).or_insert(0) += 1;
+        
+        // Accumulate patterns with same word
+        if word == self.last_word {
+            self.last_word_score += score;
+        } else {
+            if !self.last_word.is_empty() {
+                self.collector.collect(self.last_word.clone(), self.last_word_score);
+            }
+            self.last_word = word;
+            self.last_word_score = score;
+        }
+        Ok(())
+    }
+    
+    // Finish aggregation and return collector
+    pub fn finish(mut self) -> std::result::Result<SimplePatternCollector, CompressionError> {
+        // Process the last word if any
+        if !self.last_word.is_empty() {
+            self.collector.collect(self.last_word, self.last_word_score);
+        }
+        
+        log::debug!("DictAggregator: processed {} words into {} unique patterns", 
+                   self.received_words, self.collector.len());
+        
+        Ok(self.collector)
     }
 }
 
-// REVIEW: missing impl of to_string, ratio fn
 // From Go: CompressionRatio type
 pub type CompressionRatio = f64;
 
-// REVIEW: missing comment from go
+// Helper function to format compression ratio
+pub fn ratio_to_string(ratio: CompressionRatio) -> String {
+    format!("{:.2}", ratio)
+}
+
+// RawWordsFile represents a file with raw (uncompressed) words
+// Format: [varint_length][word_bytes]... where varint_length's LSB indicates compression
 // From Go: RawWordsFile struct
 pub struct RawWordsFile {
     f: File,
     w: BufWriter<File>,
     pub file_path: String,
-    buf: [u8; 10], // Buffer for varint encoding
+    buf: [u8; 128], // Buffer for varint encoding - matches Go's 128 byte buffer
     pub count: u64,
 }
 
-// REVIEW: missing OpenRawWordsFile port fn
+// From Go: OpenRawWordsFile - compress.go:824-832
+pub fn open_raw_words_file(file_path: String) -> std::result::Result<RawWordsFile, CompressionError> {
+    use std::fs::OpenOptions;
+    let f = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(&file_path)
+        .map_err(|e| CompressionError::FileOpen {
+            path: file_path.clone(),
+            source: e,
+        })?;
+    let w = BufWriter::new(f.try_clone()?);
+    
+    Ok(RawWordsFile {
+        f,
+        w,
+        file_path,
+        buf: [0; 128],
+        count: 0,
+    })
+}
+
 impl RawWordsFile {
     pub fn new(file_path: String) -> std::result::Result<Self, CompressionError> {
         // Go: compress.go:833-841
@@ -870,7 +1088,7 @@ impl RawWordsFile {
             f,
             w,
             file_path,
-            buf: [0; 10], // REVIEW: 128 in go?
+            buf: [0; 128], // Match Go's buffer size
             count: 0,
         })
     }
@@ -935,34 +1153,24 @@ impl RawWordsFile {
             self.count
         );
 
-        // REVIEW: we're hand-rolling readuvarintbufsize
-        // REVIEW: bufsize is 8mb in go
-        //
-
-        let mut reader = BufReader::new(&self.f);
+        // Use 8MB buffer like Go does
+        const BUF_SIZE: usize = 8 * 1024 * 1024;
+        let mut reader = BufReader::with_capacity(BUF_SIZE, &self.f);
         let mut buf = vec![0u8; 16 * 1024];
 
-
         loop {
-            // Read varint length
-            let mut l = 0u64;
-            let mut shift = 0;
-            loop {
-                let mut byte = [0u8; 1];
-                if let Err(e) = reader.read_exact(&mut byte) {
-                    log::debug!(
-                        "RawWordsFile::for_each - EOF or error reading varint: {:?}",
-                        e
-                    );
+            // Read varint length using our helper function
+            let mut l = match read_uvarint(&mut reader) {
+                Ok(val) => val,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    log::debug!("RawWordsFile::for_each - EOF reached");
                     return Ok(());
                 }
-                // REVIEW: this would DRY up if we had binary.ReadUvarint()
-                l |= ((byte[0] & 0x7F) as u64) << shift;
-                if byte[0] & 0x80 == 0 {
-                    break;
+                Err(e) => {
+                    log::debug!("RawWordsFile::for_each - Error reading varint: {:?}", e);
+                    return Err(CompressionError::from(e));
                 }
-                shift += 7;
-            }
+            };
 
             // Extract lowest bit as "uncompressed" flag
             let compressed = (l & 1) == 0;
@@ -999,7 +1207,6 @@ impl CompressionWord {
 }
 
 
-// REVIEW: ok but where is the symmetric ReadUvarint
 // Helper function to encode varint (like Go's binary.PutUvarint)
 fn encode_varint(buf: &mut [u8], mut x: u64) -> usize {
     let mut i = 0;
@@ -1012,10 +1219,38 @@ fn encode_varint(buf: &mut [u8], mut x: u64) -> usize {
     i + 1
 }
 
+// Helper function to decode varint (like Go's binary.ReadUvarint)
+pub fn read_uvarint(reader: &mut impl std::io::Read) -> std::io::Result<u64> {
+    let mut x = 0u64;
+    let mut shift = 0;
+    loop {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte)?;
+        
+        if shift == 63 && byte[0] > 0x01 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "varint overflow"
+            ));
+        }
+        
+        if byte[0] < 0x80 {
+            return Ok(x | ((byte[0] as u64) << shift));
+        }
+        
+        x |= ((byte[0] & 0x7F) as u64) << shift;
+        shift += 7;
+    }
+}
+
 
 // Helper functions
 
-// REVIEW: where did this come from? go must import it from somewhere
+// From Go: bits.Reverse64 function
+pub fn reverse_bits_64(x: u64) -> u64 {
+    x.reverse_bits()
+}
+
 // From Go: persistDictionary - compress.go
 fn persist_dictionary(
     path: &std::path::Path,

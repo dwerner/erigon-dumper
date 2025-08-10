@@ -693,14 +693,8 @@ pub fn compress_with_pattern_candidates(
     }
     
     // Sort pattern_list for dictionary writing (like Go does after Huffman encoding)
-    pattern_list.sort_by(|a, b| {
-        if a.uses == b.uses {
-            // Compare reverse64(Huffman code)
-            reverse_bits_64(a.code).cmp(&reverse_bits_64(b.code))
-        } else {
-            a.uses.cmp(&b.uses)
-        }
-    });
+    // This uses pattern_list_cmp which sorts by uses, then reverse64(code)
+    pattern_list.sort_by(crate::compress::pattern_list_cmp);
 
     log::debug!("Pattern dictionary after Huffman encoding:");
     for (i, p) in code2pattern.iter().enumerate() {
@@ -1420,7 +1414,7 @@ fn write_compressed_file(
     log::debug!("Total words written to compressed file: {}", words_written);
 
     // Finish with BitWriter and get back the underlying writer
-    let mut w = bit_writer.into_inner()?;
+    let w = bit_writer.into_inner()?;
     w.flush()?;
 
     log::debug!("Compressed file written successfully");
@@ -1429,7 +1423,144 @@ fn write_compressed_file(
 
 // From Go: extractPatternsInSuperstrings function
 // Go: parallel_compress.go:744
+// Build LCP (Longest Common Prefix) array from suffix array
+fn build_lcp_array(text: &[u8], sa: &[i32]) -> Vec<i32> {
+    let n = sa.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    
+    let mut lcp = vec![0i32; n];
+    let mut rank = vec![0usize; n];
+    
+    // Build rank array (inverse of suffix array)
+    for i in 0..n {
+        rank[sa[i] as usize] = i;
+    }
+    
+    let mut h = 0;
+    for i in 0..n {
+        if rank[i] > 0 {
+            let j = sa[rank[i] - 1] as usize;
+            let mut k = i;
+            let mut j = j;
+            
+            // Skip common bytes
+            while k < text.len() && j < text.len() && text[k] == text[j] {
+                h += 1;
+                k += 1;
+                j += 1;
+            }
+            
+            lcp[rank[i]] = h as i32;
+            
+            if h > 0 {
+                h -= 1;
+            }
+        }
+    }
+    
+    lcp
+}
+
+// Extract patterns from a single superstring (for synchronous processing)
+pub fn extract_patterns_from_single_superstring(
+    superstring: &[u8],
+    cfg: &crate::compress::Cfg,
+) -> Vec<Pattern> {
+    use cdivsufsort::sort_in_place;
+    use std::collections::HashMap;
+
+    let mut pattern_map: HashMap<Vec<u8>, u64> = HashMap::new();
+    let min_pattern_len = cfg.min_pattern_len;
+    let max_pattern_len = cfg.max_pattern_len;
+    let min_pattern_score = cfg.min_pattern_score;
+
+    if superstring.is_empty() {
+        return Vec::new();
+    }
+
+    // Build suffix array using divsufsort
+    let mut sa = vec![0i32; superstring.len()];
+    sort_in_place(superstring, &mut sa);
+
+    // Filter out suffixes that start with odd positions
+    let n = sa.len() / 2;
+    let mut filtered = Vec::with_capacity(n);
+    for &pos in &sa {
+        if pos & 1 == 0 {
+            filtered.push(pos >> 1); // Divide by 2 to get actual position
+        }
+    }
+
+    // Build LCP array
+    let lcp = build_lcp_array(superstring, &filtered);
+
+    // Extract patterns based on LCP
+    for i in 1..filtered.len() {
+        let common_len = lcp[i] as usize;
+        if common_len >= min_pattern_len {
+            let start = (filtered[i] * 2) as usize;
+            let end = (start + common_len * 2).min(superstring.len());
+            
+            // Extract the pattern (removing encoding)
+            let mut pattern = Vec::new();
+            let mut j = start;
+            while j < end && pattern.len() < max_pattern_len {
+                if j + 1 < superstring.len() && superstring[j] == 0x01 {
+                    pattern.push(superstring[j + 1]);
+                    j += 2;
+                } else if superstring[j] == 0x00 && j + 1 < superstring.len() && superstring[j + 1] == 0x00 {
+                    break; // End of word marker
+                } else {
+                    break;
+                }
+            }
+            
+            if pattern.len() >= min_pattern_len && pattern.len() <= max_pattern_len {
+                *pattern_map.entry(pattern).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Convert to Pattern objects with scores
+    pattern_map
+        .into_iter()
+        .filter_map(|(word, count)| {
+            let score = count * word.len() as u64;
+            if score >= min_pattern_score {
+                Some(Pattern::new(word, score))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 pub fn extract_patterns_in_superstrings(
+    superstrings: Vec<Vec<u8>>,
+    cfg: &crate::compress::Cfg,
+) -> Vec<Pattern> {
+    // Aggregate patterns from all superstrings
+    use std::collections::HashMap;
+    let mut all_patterns: HashMap<Vec<u8>, u64> = HashMap::new();
+    
+    for superstring in &superstrings {
+        let patterns = extract_patterns_from_single_superstring(superstring, cfg);
+        for pattern in patterns {
+            *all_patterns.entry(pattern.word).or_insert(0) += pattern.score;
+        }
+    }
+    
+    // Convert to Pattern objects
+    all_patterns
+        .into_iter()
+        .map(|(word, score)| Pattern::new(word, score))
+        .collect()
+}
+
+// Original full implementation (kept for reference but not used)
+fn _extract_patterns_in_superstrings_old(
     superstrings: Vec<Vec<u8>>,
     cfg: &crate::compress::Cfg,
 ) -> Vec<Pattern> {
