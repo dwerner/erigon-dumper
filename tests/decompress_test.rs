@@ -62,7 +62,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Debug)
             .try_init();
-            
+
         let (_tmp_dir, decompressor) = prepare_lorem_dict();
         let mut getter = decompressor.make_getter();
 
@@ -78,7 +78,11 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
                 log::debug!("Reading word {}", i);
                 let (word, _) = getter.next(Vec::new());
                 let expected = format!("{} {}", String::from_utf8_lossy(w), i);
-                log::debug!("Got word: {:?}, expected: {:?}", String::from_utf8_lossy(&word), expected);
+                log::debug!(
+                    "Got word: {:?}, expected: {:?}",
+                    String::from_utf8_lossy(&word),
+                    expected
+                );
                 assert_eq!(String::from_utf8_lossy(&word), expected);
             }
             i += 1;

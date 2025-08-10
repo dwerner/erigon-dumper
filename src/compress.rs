@@ -210,8 +210,11 @@ impl Compressor {
             self.superstrings.push(ss);
         }
 
-        log::info!("[{}] Building dictionary from {} superstrings", 
-                  self.log_prefix, self.superstrings.len());
+        log::info!(
+            "[{}] Building dictionary from {} superstrings",
+            self.log_prefix,
+            self.superstrings.len()
+        );
 
         // Build dictionary from collected superstrings (synchronous version)
         let dict_builder = self.build_dictionary_from_superstrings()?;
@@ -225,10 +228,11 @@ impl Compressor {
         }
 
         // Create compressed file
-        let cf = File::create(&self.tmp_out_file_path).map_err(|e| CompressionError::FileCreate {
-            path: self.tmp_out_file_path.clone(),
-            source: e,
-        })?;
+        let cf =
+            File::create(&self.tmp_out_file_path).map_err(|e| CompressionError::FileCreate {
+                path: self.tmp_out_file_path.clone(),
+                source: e,
+            })?;
 
         // Compress with pattern candidates
         if let Some(ref mut uf) = self.uncompressed_file {
@@ -294,48 +298,52 @@ impl Compressor {
         Ok(())
     }
 
-
     // Build dictionary from superstrings (synchronous version of Go's DictionaryBuilderFromCollectors)
-    fn build_dictionary_from_superstrings(&mut self) -> std::result::Result<DictionaryBuilder, CompressionError> {
+    fn build_dictionary_from_superstrings(
+        &mut self,
+    ) -> std::result::Result<DictionaryBuilder, CompressionError> {
         // This is the synchronous equivalent of Go's parallel_compress.go:916-947
-        
+
         // Create aggregator to collect patterns from all superstrings
         let mut dict_aggregator = DictAggregator::new();
-        
+
         // Process each superstring to extract patterns (synchronous instead of parallel)
         for superstring in &self.superstrings {
             if superstring.is_empty() {
                 continue;
             }
-            
+
             // Extract patterns from this superstring
             let patterns = crate::parallel_compress::extract_patterns_from_single_superstring(
                 superstring,
                 &self.cfg,
             );
-            
+
             // Add patterns to aggregator
             for pattern in patterns {
                 dict_aggregator.process_word(pattern.word, pattern.score)?;
             }
         }
-        
+
         // Finish aggregation
         let collector = dict_aggregator.finish()?;
-        
+
         // Build dictionary from collected patterns
         let mut dict_builder = DictionaryBuilder::new(self.cfg.dict_reducer_soft_limit);
         dict_builder.load_from_collector(collector);
-        
+
         // Apply hard limit
         dict_builder.finish(self.cfg.max_dict_patterns);
-        
+
         // Sort patterns (for compatibility, though heap already maintains order)
         dict_builder.sort();
-        
-        log::info!("[{}] Dictionary built with {} patterns", 
-                  self.log_prefix, dict_builder.len());
-        
+
+        log::info!(
+            "[{}] Dictionary built with {} patterns",
+            self.log_prefix,
+            dict_builder.len()
+        );
+
         Ok(dict_builder)
     }
 }
@@ -383,7 +391,7 @@ impl DictionaryBuilder {
     pub fn process_word(&mut self, chars: Vec<u8>, score: u64) {
         // Push new pattern to heap
         self.items.push(Pattern::new(chars, score));
-        
+
         // If over soft limit, remove the smallest score element
         if self.items.len() > self.soft_limit {
             // Since BinaryHeap is a max-heap and Pattern's Ord is reversed for min-heap behavior,
@@ -416,7 +424,7 @@ impl DictionaryBuilder {
             self.last_word.clear();
             self.last_word_score = 0;
         }
-        
+
         // Keep only hard_limit items by removing lowest scores
         while self.items.len() > hard_limit {
             self.items.pop();
@@ -432,13 +440,13 @@ impl DictionaryBuilder {
         let mut items: Vec<_> = self.items.iter().collect();
         // Sort by score descending (highest score first)
         items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.word.cmp(&b.word)));
-        
+
         // Iterate in sorted order
         for pattern in items {
             f(pattern.score, &pattern.word);
         }
     }
-    
+
     // Get patterns as a vector (for use in compression)
     pub fn into_patterns(self) -> Vec<Pattern> {
         // Convert heap to sorted vector
@@ -461,7 +469,6 @@ impl DictionaryBuilder {
         // This is a no-op for compatibility
     }
 }
-
 
 // Pattern represents a byte sequence to be used in compression dictionary
 // From Go: Pattern struct
@@ -649,7 +656,6 @@ pub struct Position {
     pub depth: usize, // Depth of the position in the huffman tree
 }
 
-
 // From Go: PositionHuff struct (for Huffman tree)
 pub struct PositionHuff {
     pub p0: Option<Box<Position>>,
@@ -740,9 +746,7 @@ impl Ord for PositionHuffWrapper {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Reverse order for min-heap
         match other.inner.uses.cmp(&self.inner.uses) {
-            std::cmp::Ordering::Equal => {
-                other.inner.tie_breaker.cmp(&self.inner.tie_breaker)
-            }
+            std::cmp::Ordering::Equal => other.inner.tie_breaker.cmp(&self.inner.tie_breaker),
             ord => ord,
         }
     }
@@ -998,30 +1002,34 @@ impl DictAggregator {
     ) -> std::result::Result<(), CompressionError> {
         self.received_words += 1;
         *self.dist.entry(word.len()).or_insert(0) += 1;
-        
+
         // Accumulate patterns with same word
         if word == self.last_word {
             self.last_word_score += score;
         } else {
             if !self.last_word.is_empty() {
-                self.collector.collect(self.last_word.clone(), self.last_word_score);
+                self.collector
+                    .collect(self.last_word.clone(), self.last_word_score);
             }
             self.last_word = word;
             self.last_word_score = score;
         }
         Ok(())
     }
-    
+
     // Finish aggregation and return collector
     pub fn finish(mut self) -> std::result::Result<SimplePatternCollector, CompressionError> {
         // Process the last word if any
         if !self.last_word.is_empty() {
             self.collector.collect(self.last_word, self.last_word_score);
         }
-        
-        log::debug!("DictAggregator: processed {} words into {} unique patterns", 
-                   self.received_words, self.collector.len());
-        
+
+        log::debug!(
+            "DictAggregator: processed {} words into {} unique patterns",
+            self.received_words,
+            self.collector.len()
+        );
+
         Ok(self.collector)
     }
 }
@@ -1046,7 +1054,9 @@ pub struct RawWordsFile {
 }
 
 // From Go: OpenRawWordsFile - compress.go:824-832
-pub fn open_raw_words_file(file_path: String) -> std::result::Result<RawWordsFile, CompressionError> {
+pub fn open_raw_words_file(
+    file_path: String,
+) -> std::result::Result<RawWordsFile, CompressionError> {
     use std::fs::OpenOptions;
     let f = OpenOptions::new()
         .read(true)
@@ -1057,7 +1067,7 @@ pub fn open_raw_words_file(file_path: String) -> std::result::Result<RawWordsFil
             source: e,
         })?;
     let w = BufWriter::new(f.try_clone()?);
-    
+
     Ok(RawWordsFile {
         f,
         w,
@@ -1192,7 +1202,6 @@ impl RawWordsFile {
     }
 }
 
-
 // From Go: CompressionWord struct (from parallel_compress.go)
 #[derive(Debug, Clone)]
 pub struct CompressionWord {
@@ -1205,7 +1214,6 @@ impl CompressionWord {
         CompressionWord { word, order }
     }
 }
-
 
 // Helper function to encode varint (like Go's binary.PutUvarint)
 fn encode_varint(buf: &mut [u8], mut x: u64) -> usize {
@@ -1226,23 +1234,22 @@ pub fn read_uvarint(reader: &mut impl std::io::Read) -> std::io::Result<u64> {
     loop {
         let mut byte = [0u8; 1];
         reader.read_exact(&mut byte)?;
-        
+
         if shift == 63 && byte[0] > 0x01 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "varint overflow"
+                "varint overflow",
             ));
         }
-        
+
         if byte[0] < 0x80 {
             return Ok(x | ((byte[0] as u64) << shift));
         }
-        
+
         x |= ((byte[0] & 0x7F) as u64) << shift;
         shift += 7;
     }
 }
-
 
 // Helper functions
 

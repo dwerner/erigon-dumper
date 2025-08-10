@@ -17,7 +17,7 @@ pub enum CompressionError {
         #[source]
         source: io::Error,
     },
-    
+
     #[error("Failed to open file: {path}: {source}")]
     FileOpen {
         // REVIEW: pathbuf?

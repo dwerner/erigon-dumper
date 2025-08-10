@@ -212,12 +212,17 @@ impl Decompressor {
                 Some(pos_dict.pos[0])
             }
         );
-        
+
         // Debug: print how codes map to positions
         log::debug!("Position table mappings (code -> position):");
         for i in 0..16.min(pos_dict.pos.len()) {
             if pos_dict.lens[i] > 0 {
-                log::debug!("  code {} -> position {}, bits {}", i, pos_dict.pos[i], pos_dict.lens[i]);
+                log::debug!(
+                    "  code {} -> position {}, bits {}",
+                    i,
+                    pos_dict.pos[i],
+                    pos_dict.lens[i]
+                );
             }
         }
 
@@ -478,7 +483,8 @@ impl<'a> Getter<'a> {
             "Getter::next called, data_p: {}, data_len: {}, next 10 bytes: {:02x?}",
             self.data_p,
             self.data.len(),
-            &self.data[self.data_p as usize..std::cmp::min(self.data_p as usize + 10, self.data.len())]
+            &self.data
+                [self.data_p as usize..std::cmp::min(self.data_p as usize + 10, self.data.len())]
         );
         let save_pos = self.data_p;
         let mut word_len = self.next_pos(true);
@@ -710,22 +716,28 @@ impl<'a> Getter<'a> {
         let mut add = 0u64;
         let mut buf_pos = 0;
         let mut last_uncovered = 0;
-        
+
         // Read patterns and positions, calculating uncovered bytes as we go
         let mut pos = self.next_pos(false);
         let mut pattern_count = 0;
         while pos != 0 {
             pattern_count += 1;
             buf_pos += pos as usize - 1;
-            
+
             if buf_pos > last_uncovered {
                 add += (buf_pos - last_uncovered) as u64;
             }
-            
+
             let pattern = self.next_pattern();
-            log::debug!("skip(): pattern {}: pos={}, len={}, buf_pos={}", pattern_count, pos, pattern.len(), buf_pos);
+            log::debug!(
+                "skip(): pattern {}: pos={}, len={}, buf_pos={}",
+                pattern_count,
+                pos,
+                pattern.len(),
+                buf_pos
+            );
             last_uncovered = buf_pos + pattern.len();
-            
+
             pos = self.next_pos(false);
         }
         log::debug!("skip(): skipped {} patterns", pattern_count);
@@ -734,16 +746,19 @@ impl<'a> Getter<'a> {
             self.data_p += 1;
             self.data_bit = 0;
         }
-        
+
         if word_len as usize > last_uncovered {
             add += (word_len as usize - last_uncovered) as u64;
         }
-        
+
         // Uncovered characters
         self.data_p += add;
-        log::debug!("skip(): final data_p={}, add={}, next 10 bytes: {:02x?}", 
-            self.data_p, add,
-            &self.data[self.data_p as usize..std::cmp::min(self.data_p as usize + 10, self.data.len())]
+        log::debug!(
+            "skip(): final data_p={}, add={}, next 10 bytes: {:02x?}",
+            self.data_p,
+            add,
+            &self.data
+                [self.data_p as usize..std::cmp::min(self.data_p as usize + 10, self.data.len())]
         );
 
         self.data_p
