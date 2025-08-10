@@ -867,11 +867,8 @@ pub fn compress_with_pattern_candidates(
         );
     }
 
-    // CRITICAL: The recursive decompression algorithm requires positions to be
-    // sorted properly for canonical Huffman reconstruction. While Go sorts by
-    // uses then reverse64(code), the actual dictionary write order must ensure
-    // positions are processable by the recursive algorithm.
-    // Sort by depth first (for proper grouping), then by position value
+    // Sort positions by depth first (for proper grouping), then by position value
+    // This ensures the decoder's recursive algorithm can process them correctly
     position_huff.positions.sort_by(|a, b| {
         if a.depth == b.depth {
             a.pos.cmp(&b.pos)
@@ -879,7 +876,8 @@ pub fn compress_with_pattern_candidates(
             a.depth.cmp(&b.depth)
         }
     });
-    log::debug!("After final position sorting for dictionary (by depth, then code):");
+    
+    log::debug!("After final position sorting for dictionary:");
     for p in &position_huff.positions {
         log::debug!(
             "  Position {}: depth={}, code={}, bits={}",
@@ -1162,7 +1160,14 @@ fn write_compressed_file(
         })?;
 
         // Encode word length+1 with position huffman code
+        if words_written < 3 {
+            log::debug!("Word {}: encoding position {} (word_len + 1 = {} + 1)", 
+                words_written + 1, word_len + 1, word_len);
+        }
         if let Some(pos_code) = pos2code.get(&(word_len + 1)) {
+            if words_written < 3 {
+                log::debug!("  Using huffman code: {:b} ({} bits)", pos_code.code, pos_code.code_bits);
+            }
             bit_writer.encode(pos_code.code, pos_code.code_bits)?;
         } else {
             // No huffman code - write varint directly
@@ -1194,6 +1199,21 @@ fn write_compressed_file(
         }
 
         let (pattern_count, _) = decode_varint(&pattern_count_buf[..bytes_read])?;
+        // Debug: peek at word content for first few words
+        if words_written < 3 {
+            let cur_pos = reader.stream_position()?;
+            let mut peek_data = vec![0u8; 20.min(word_len as usize)];
+            let bytes_to_read = peek_data.len();
+            reader.read_exact(&mut peek_data)?;
+            reader.seek(std::io::SeekFrom::Start(cur_pos))?;
+            log::debug!(
+                "Word {} intermediate data (first {} bytes): {:02x?}",
+                words_written + 1,
+                bytes_to_read,
+                &peek_data
+            );
+        }
+        
         log::debug!(
             "Word {} (length {}): pattern_count = {} (bytes: {:02x?})",
             words_written + 1,

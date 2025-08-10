@@ -168,6 +168,7 @@ impl Decompressor {
         let words_count = u64::from_be_bytes(data[0..8].try_into().unwrap());
         let empty_words_count = u64::from_be_bytes(data[8..16].try_into().unwrap());
         let pattern_dict_size = u64::from_be_bytes(data[16..24].try_into().unwrap());
+        log::debug!("Pattern dictionary size: {}", pattern_dict_size);
 
         if 24 + pattern_dict_size > size as u64 {
             return Err(CompressionError::Other(format!(
@@ -190,6 +191,7 @@ impl Decompressor {
         }
         let pos_dict_size =
             u64::from_be_bytes(data[pos_dict_start..pos_dict_start + 8].try_into().unwrap());
+        log::debug!("Position dictionary size: {}", pos_dict_size);
 
         if pos_dict_start + 8 + pos_dict_size as usize > size as usize {
             return Err(CompressionError::Other(format!(
@@ -210,6 +212,14 @@ impl Decompressor {
                 Some(pos_dict.pos[0])
             }
         );
+        
+        // Debug: print how codes map to positions
+        log::debug!("Position table mappings (code -> position):");
+        for i in 0..16.min(pos_dict.pos.len()) {
+            if pos_dict.lens[i] > 0 {
+                log::debug!("  code {} -> position {}, bits {}", i, pos_dict.pos[i], pos_dict.lens[i]);
+            }
+        }
 
         let words_start_offset = 8 + pos_dict_size; // 8 for pos dict size + pos dict data
         let words_start = 24 + pattern_dict_size + words_start_offset;
@@ -250,8 +260,8 @@ impl Decompressor {
     pub fn make_getter(&self) -> Getter {
         let data = self.data[self.words_start as usize..].to_vec();
         log::debug!(
-            "Getter data (first 5 bytes): {:02x?}",
-            &data[..data.len().min(5)]
+            "Getter data (first 20 bytes): {:02x?}",
+            &data[..data.len().min(20)]
         );
         Getter {
             pattern_dict: self.dict.as_ref(),
@@ -465,9 +475,10 @@ impl<'a> Getter<'a> {
     // From Go: decompress.go:669
     pub fn next(&mut self, mut buf: Vec<u8>) -> (Vec<u8>, u64) {
         log::debug!(
-            "Getter::next called, data_p: {}, data_len: {}",
+            "Getter::next called, data_p: {}, data_len: {}, next 10 bytes: {:02x?}",
             self.data_p,
-            self.data.len()
+            self.data.len(),
+            &self.data[self.data_p as usize..std::cmp::min(self.data_p as usize + 10, self.data.len())]
         );
         let save_pos = self.data_p;
         let mut word_len = self.next_pos(true);
@@ -571,7 +582,7 @@ impl<'a> Getter<'a> {
                     last_uncovered,
                     buf_pos
                 );
-                if post_loop_pos as usize + dif <= self.data.len() {
+                if post_loop_pos as usize + dif <= self.data.len() && buf_pos <= buf.len() {
                     buf[last_uncovered..buf_pos].copy_from_slice(
                         &self.data[post_loop_pos as usize..post_loop_pos as usize + dif],
                     );
@@ -635,7 +646,13 @@ impl<'a> Getter<'a> {
             }
         }
 
-        self.data_p = post_loop_pos + (buf_offset + word_len as usize - last_uncovered) as u64;
+        // Calculate how many uncovered bytes we need to skip
+        let final_pos = buf_offset + word_len as usize;
+        if final_pos > last_uncovered {
+            self.data_p = post_loop_pos + (final_pos - last_uncovered) as u64;
+        } else {
+            self.data_p = post_loop_pos;
+        }
         self.data_bit = 0;
 
         log::debug!(
@@ -669,62 +686,65 @@ impl<'a> Getter<'a> {
         word.starts_with(prefix)
     }
 
-    // From Go: decompress.go:800
+    // From Go: decompress.go:756-790
     pub fn skip(&mut self) -> u64 {
-        let save_pos = self.data_p;
+        log::debug!("skip() called at data_p={}", self.data_p);
         let mut word_len = self.next_pos(true);
+        log::debug!("skip(): word_len raw={}", word_len);
 
         if word_len > 0 {
-            word_len -= 1;
+            word_len -= 1; // because when create huffman tree we do ++, because 0 is terminator
         }
+        log::debug!("skip(): word_len adjusted={}", word_len);
 
         if word_len == 0 {
             if self.data_bit > 0 {
                 self.data_p += 1;
                 self.data_bit = 0;
             }
+            log::debug!("skip(): empty word, returning data_p={}", self.data_p);
             return self.data_p;
         }
 
-        // Skip patterns
+        // Following Go's implementation exactly
+        let mut add = 0u64;
+        let mut buf_pos = 0;
+        let mut last_uncovered = 0;
+        
+        // Read patterns and positions, calculating uncovered bytes as we go
         let mut pos = self.next_pos(false);
+        let mut pattern_count = 0;
         while pos != 0 {
-            self.next_pattern();
+            pattern_count += 1;
+            buf_pos += pos as usize - 1;
+            
+            if buf_pos > last_uncovered {
+                add += (buf_pos - last_uncovered) as u64;
+            }
+            
+            let pattern = self.next_pattern();
+            log::debug!("skip(): pattern {}: pos={}, len={}, buf_pos={}", pattern_count, pos, pattern.len(), buf_pos);
+            last_uncovered = buf_pos + pattern.len();
+            
             pos = self.next_pos(false);
         }
+        log::debug!("skip(): skipped {} patterns", pattern_count);
 
         if self.data_bit > 0 {
             self.data_p += 1;
             self.data_bit = 0;
         }
-        let post_loop_pos = self.data_p;
-
-        // Reset and skip positions to calculate uncovered length
-        self.data_p = save_pos;
-        self.data_bit = 0;
-        self.next_pos(true);
-
-        let mut buf_pos = 0;
-        let mut last_uncovered = 0;
-        pos = self.next_pos(false);
-        while pos != 0 {
-            buf_pos += pos as usize - 1;
-            if buf_pos > last_uncovered {
-                // Skip uncovered bytes
-            }
-            last_uncovered = buf_pos + self.next_pattern().len();
-            pos = self.next_pos(false);
+        
+        if word_len as usize > last_uncovered {
+            add += (word_len as usize - last_uncovered) as u64;
         }
-
-        // Calculate final position
-        let skip_bytes = if word_len as usize > last_uncovered {
-            word_len as usize - last_uncovered
-        } else {
-            0
-        };
-
-        self.data_p = post_loop_pos + skip_bytes as u64;
-        self.data_bit = 0;
+        
+        // Uncovered characters
+        self.data_p += add;
+        log::debug!("skip(): final data_p={}, add={}, next 10 bytes: {:02x?}", 
+            self.data_p, add,
+            &self.data[self.data_p as usize..std::cmp::min(self.data_p as usize + 10, self.data.len())]
+        );
 
         self.data_p
     }
