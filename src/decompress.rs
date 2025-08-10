@@ -201,14 +201,24 @@ impl Decompressor {
         // Parse position dictionary
         let pos_dict_data = &data[pos_dict_start + 8..pos_dict_start + 8 + pos_dict_size as usize];
         let pos_dict = parse_position_dictionary(pos_dict_data)?;
-        log::debug!("Position dict: bit_len: {}, pos[0]: {:?}", 
-            pos_dict.bit_len, 
-            if pos_dict.pos.is_empty() { None } else { Some(pos_dict.pos[0]) });
+        log::debug!(
+            "Position dict: bit_len: {}, pos[0]: {:?}",
+            pos_dict.bit_len,
+            if pos_dict.pos.is_empty() {
+                None
+            } else {
+                Some(pos_dict.pos[0])
+            }
+        );
 
         let words_start_offset = 8 + pos_dict_size; // 8 for pos dict size + pos dict data
         let words_start = 24 + pattern_dict_size + words_start_offset;
-        
-        log::debug!("Decompressor initialized: words_start: {}, file_size: {}", words_start, size);
+
+        log::debug!(
+            "Decompressor initialized: words_start: {}, file_size: {}",
+            words_start,
+            size
+        );
 
         Ok(Decompressor {
             f: Some(f),
@@ -239,7 +249,10 @@ impl Decompressor {
     // From Go: decompress.go:648
     pub fn make_getter(&self) -> Getter {
         let data = self.data[self.words_start as usize..].to_vec();
-        log::debug!("Getter data (first 5 bytes): {:02x?}", &data[..data.len().min(5)]);
+        log::debug!(
+            "Getter data (first 5 bytes): {:02x?}",
+            &data[..data.len().min(5)]
+        );
         Getter {
             pattern_dict: self.dict.as_ref(),
             pos_dict: self.pos_dict.as_ref(),
@@ -279,7 +292,12 @@ impl<'a> Getter<'a> {
 
     // From Go: decompress.go:550
     fn next_pos(&mut self, clean: bool) -> u64 {
-        log::debug!("next_pos called, clean: {}, data_p: {}, data_bit: {}", clean, self.data_p, self.data_bit);
+        log::debug!(
+            "next_pos called, clean: {}, data_p: {}, data_bit: {}",
+            clean,
+            self.data_p,
+            self.data_bit
+        );
         if clean && self.data_bit > 0 {
             self.data_p += 1;
             self.data_bit = 0;
@@ -316,7 +334,10 @@ impl<'a> Getter<'a> {
         }
 
         let mut current_table = table;
-        log::debug!("next_pos: entering main loop with bit_len: {}", current_table.bit_len);
+        log::debug!(
+            "next_pos: entering main loop with bit_len: {}",
+            current_table.bit_len
+        );
         loop {
             let mut code = (self.data[self.data_p as usize] >> self.data_bit) as u16;
             if 8 - self.data_bit < current_table.bit_len
@@ -325,8 +346,13 @@ impl<'a> Getter<'a> {
                 code |= (self.data[self.data_p as usize + 1] as u16) << (8 - self.data_bit);
             }
             code &= (1u16 << current_table.bit_len) - 1;
-            
-            log::debug!("next_pos: code: {}, data_p: {}, data_bit: {}", code, self.data_p, self.data_bit);
+
+            log::debug!(
+                "next_pos: code: {}, data_p: {}, data_bit: {}",
+                code,
+                self.data_p,
+                self.data_bit
+            );
 
             let l = current_table.lens[code as usize];
             log::debug!("next_pos: lens[{}] = {}", code, l);
@@ -416,7 +442,11 @@ impl<'a> Getter<'a> {
 
     // From Go: decompress.go:669
     pub fn next(&mut self, mut buf: Vec<u8>) -> (Vec<u8>, u64) {
-        log::debug!("Getter::next called, data_p: {}, data_len: {}", self.data_p, self.data.len());
+        log::debug!(
+            "Getter::next called, data_p: {}, data_len: {}",
+            self.data_p,
+            self.data.len()
+        );
         let save_pos = self.data_p;
         let mut word_len = self.next_pos(true);
 
@@ -474,18 +504,32 @@ impl<'a> Getter<'a> {
         }
 
         // Fill any remaining uncovered data
-        log::debug!("buf_offset: {}, word_len: {}, last_uncovered: {}", buf_offset, word_len, last_uncovered);
+        log::debug!(
+            "buf_offset: {}, word_len: {}, last_uncovered: {}",
+            buf_offset,
+            word_len,
+            last_uncovered
+        );
         if buf_offset + word_len as usize > last_uncovered {
             let dif = buf_offset + word_len as usize - last_uncovered;
-            log::debug!("Copying {} uncovered bytes from position {}", dif, post_loop_pos);
+            log::debug!(
+                "Copying {} uncovered bytes from position {}",
+                dif,
+                post_loop_pos
+            );
             if post_loop_pos as usize + dif <= self.data.len() {
                 let mut final_data = vec![0u8; dif];
-                final_data
-                    .copy_from_slice(&self.data[post_loop_pos as usize..post_loop_pos as usize + dif]);
+                final_data.copy_from_slice(
+                    &self.data[post_loop_pos as usize..post_loop_pos as usize + dif],
+                );
                 buf[last_uncovered..last_uncovered + dif].copy_from_slice(&final_data);
             } else {
-                log::error!("Not enough data: need {} bytes at pos {}, but data len is {}", 
-                    dif, post_loop_pos, self.data.len());
+                log::error!(
+                    "Not enough data: need {} bytes at pos {}, but data len is {}",
+                    dif,
+                    post_loop_pos,
+                    self.data.len()
+                );
             }
         }
 
@@ -736,9 +780,18 @@ fn parse_position_dictionary(data: &[u8]) -> Result<PosTable, CompressionError> 
     let mut i = 0;
     let positions_count = positions.len();
 
-    log::debug!("Parsing position dictionary: {} positions, max_depth={}", positions_count, pos_max_depth);
+    log::debug!(
+        "Parsing position dictionary: {} positions, max_depth={}",
+        positions_count,
+        pos_max_depth
+    );
     for j in 0..positions_count {
-        log::debug!("  Position[{}]: depth={}, pos={}", j, pos_depths[j], positions[j]);
+        log::debug!(
+            "  Position[{}]: depth={}, pos={}",
+            j,
+            pos_depths[j],
+            positions[j]
+        );
     }
 
     while i < positions_count {
@@ -793,21 +846,20 @@ fn build_pattern_table(huffs: &[(u64, Vec<Vec<u8>>)]) -> Result<PatternTable, Co
 }
 
 // Build position table from huffman tree data using Go's recursive approach
-fn build_pos_table(huffs: &[(u64, Vec<u64>)], max_depth: u64) -> Result<PosTable, CompressionError> {
+fn build_pos_table(
+    huffs: &[(u64, Vec<u64>)],
+    max_depth: u64,
+) -> Result<PosTable, CompressionError> {
     // Use max_depth as bit_len, with minimum of 9 (matching Go implementation)
     // From Go: decompress.go:316-320
-    let bit_len = if max_depth > 9 {
-        9
-    } else {
-        max_depth as usize
-    };
-    
+    let bit_len = if max_depth > 9 { 9 } else { max_depth as usize };
+
     let mut table = PosTable::new(bit_len);
 
     // Flatten huffs back to parallel arrays like Go
     let mut pos_depths = Vec::new();
     let mut positions = Vec::new();
-    
+
     for (depth, pos_list) in huffs {
         for &pos in pos_list {
             pos_depths.push(*depth);
@@ -823,7 +875,7 @@ fn build_pos_table(huffs: &[(u64, Vec<u64>)], max_depth: u64) -> Result<PosTable
 // Recursive position table builder (matching Go's buildPosTable exactly)
 fn build_pos_table_recursive(
     depths: &[u64],
-    positions: &[u64], 
+    positions: &[u64],
     table: &mut PosTable,
     code: u16,
     bits: u8,
@@ -833,7 +885,7 @@ fn build_pos_table_recursive(
     if depths.is_empty() {
         return Ok(0);
     }
-    
+
     if depth == depths[0] {
         let pos = positions[0];
         if table.bit_len == bits as usize {
@@ -853,17 +905,25 @@ fn build_pos_table_recursive(
         log::debug!("  Table[code={}] = pos={}, len={}", code, pos, bits);
         return Ok(1);
     }
-    
+
     // Recursive split like Go
-    let b0 = build_pos_table_recursive(depths, positions, table, code, bits + 1, depth + 1, max_depth - 1)?;
+    let b0 = build_pos_table_recursive(
+        depths,
+        positions,
+        table,
+        code,
+        bits + 1,
+        depth + 1,
+        max_depth - 1,
+    )?;
     let b1 = build_pos_table_recursive(
-        &depths[b0..], 
-        &positions[b0..], 
-        table, 
-        (1u16 << bits) | code, 
-        bits + 1, 
-        depth + 1, 
-        max_depth - 1
+        &depths[b0..],
+        &positions[b0..],
+        table,
+        (1u16 << bits) | code,
+        bits + 1,
+        depth + 1,
+        max_depth - 1,
     )?;
     Ok(b0 + b1)
 }

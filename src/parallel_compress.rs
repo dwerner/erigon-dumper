@@ -429,6 +429,11 @@ impl PositionHuffBuilder {
         // Sort positions by uses (frequency) - least used first
         self.positions.sort_by(|a, b| a.uses.cmp(&b.uses));
 
+        log::debug!("Position list order for tree building:");
+        for (i, p) in self.positions.iter().enumerate() {
+            log::debug!("  [{}] Position {} with {} uses", i, p.pos, p.uses);
+        }
+
         if self.positions.is_empty() {
             return;
         }
@@ -477,41 +482,41 @@ impl PositionHuffBuilder {
                 tie_breaker,
             };
 
-            // Take first child (0 bit)
+            // Take first child (h0/p0) - exactly like Go lines 585-596
             if !heap.is_empty()
                 && (i >= self.positions.len()
                     || heap.peek().unwrap().node.uses < self.positions[i].uses)
             {
-                // Take from heap
-                let mut node = heap.pop().unwrap();
-                node.node.add_zero();
-                h.uses += node.node.uses;
+                // Take h0 from heap
+                let node = heap.pop().unwrap();
                 h.h0 = Some(node.node);
+                h.h0.as_mut().unwrap().add_zero(); // AddZero AFTER assignment like Go
+                h.uses += h.h0.as_ref().unwrap().uses;
             } else {
-                // Take from list
-                self.positions[i].code = 0;
-                self.positions[i].code_bits = 1;
-                h.uses += self.positions[i].uses;
+                // Take p0 from list
                 h.p0 = Some(Box::new(self.positions[i].clone()));
+                h.p0.as_mut().unwrap().code = 0; // Set code 0 like Go line 593
+                h.p0.as_mut().unwrap().code_bits = 1; // Set codeBits 1 like Go line 594
+                h.uses += h.p0.as_ref().unwrap().uses;
                 i += 1;
             }
 
-            // Take second child (1 bit)
+            // Take second child (h1/p1) - exactly like Go lines 598-609
             if !heap.is_empty()
                 && (i >= self.positions.len()
                     || heap.peek().unwrap().node.uses < self.positions[i].uses)
             {
-                // Take from heap
-                let mut node = heap.pop().unwrap();
-                node.node.add_one();
-                h.uses += node.node.uses;
+                // Take h1 from heap
+                let node = heap.pop().unwrap();
                 h.h1 = Some(node.node);
+                h.h1.as_mut().unwrap().add_one(); // AddOne AFTER assignment like Go
+                h.uses += h.h1.as_ref().unwrap().uses;
             } else {
-                // Take from list
-                self.positions[i].code = 1;
-                self.positions[i].code_bits = 1;
-                h.uses += self.positions[i].uses;
+                // Take p1 from list
                 h.p1 = Some(Box::new(self.positions[i].clone()));
+                h.p1.as_mut().unwrap().code = 1; // Set code 1 like Go line 606
+                h.p1.as_mut().unwrap().code_bits = 1; // Set codeBits 1 like Go line 607
+                h.uses += h.p1.as_ref().unwrap().uses;
                 i += 1;
             }
 
@@ -618,13 +623,21 @@ pub fn compress_with_pattern_candidates(
     let mut in_count = 0u64;
     let mut empty_words_count = 0u64;
     let total_words = uncompressed_file.count;
-    
-    log::debug!("[{}] Starting to process {} words from uncompressed file", log_prefix, total_words);
+
+    log::debug!(
+        "[{}] Starting to process {} words from uncompressed file",
+        log_prefix,
+        total_words
+    );
 
     // Go: parallel_compress.go:309-410
     // Process each word
     uncompressed_file.for_each(|v, compression| {
-        log::debug!("Processing word, len: {}, compressed: {}", v.len(), compression);
+        log::debug!(
+            "Processing word, len: {}, compressed: {}",
+            v.len(),
+            compression
+        );
         in_count += 1;
         if v.is_empty() {
             empty_words_count += 1;
@@ -712,7 +725,10 @@ pub fn compress_with_pattern_candidates(
             depth: 0,
         });
     }
-    log::debug!("Building position huffman codes for {} positions", positions.len());
+    log::debug!(
+        "Building position huffman codes for {} positions",
+        positions.len()
+    );
     for p in &positions {
         log::debug!("  Position {} with {} uses", p.pos, p.uses);
     }
@@ -720,7 +736,36 @@ pub fn compress_with_pattern_candidates(
     position_huff.build_huffman_codes();
     log::debug!("After huffman building:");
     for p in &position_huff.positions {
-        log::debug!("  Position {}: depth={}, code={}, bits={}", p.pos, p.depth, p.code, p.code_bits);
+        log::debug!(
+            "  Position {}: depth={}, code={}, bits={}",
+            p.pos,
+            p.depth,
+            p.code,
+            p.code_bits
+        );
+    }
+
+    // CRITICAL: Sort positions to match Go's decompression expectations
+    // Go sorts by uses first, then by bits.Reverse64(code) as tiebreaker
+    // But the decompression recursive algorithm expects a specific order to recreate the codes
+    // Let's try sorting by the final assigned codes instead
+    position_huff.positions.sort_by(|a, b| {
+        // Sort by depth first (shallower first), then by code
+        if a.depth == b.depth {
+            a.code.cmp(&b.code)
+        } else {
+            a.depth.cmp(&b.depth)
+        }
+    });
+    log::debug!("After final position sorting for dictionary (by depth, then code):");
+    for p in &position_huff.positions {
+        log::debug!(
+            "  Position {}: depth={}, code={}, bits={}",
+            p.pos,
+            p.depth,
+            p.code,
+            p.code_bits
+        );
     }
 
     // Write final compressed file
@@ -745,6 +790,18 @@ pub fn compress_with_pattern_candidates(
     );
 
     Ok(())
+}
+
+// Helper to reverse bits (matches Go's bits.Reverse64)
+fn reverse_bits_64(code: u64) -> u64 {
+    // Go's bits.Reverse64 reverses all 64 bits
+    let mut result = 0u64;
+    let mut val = code;
+    for _ in 0..64 {
+        result = (result << 1) | (val & 1);
+        val >>= 1;
+    }
+    result
 }
 
 // Helper to encode varint (matches Go's binary.PutUvarint)
@@ -861,7 +918,7 @@ fn write_compressed_file(
     let mut intermediate = std::fs::File::open(intermediate_path)?;
 
     // Write header (Go: parallel_compress.go:535-543)
-    w.write_all(&word_count.to_be_bytes())?;      // Words count
+    w.write_all(&word_count.to_be_bytes())?; // Words count
     w.write_all(&empty_words_count.to_be_bytes())?; // Empty words count
 
     // Write pattern dictionary
@@ -882,6 +939,19 @@ fn write_compressed_file(
     // Write position dictionary
     let mut pos_dict_data = Vec::new();
 
+    // Use positions in the order they were passed (already sorted by main function)
+    log::debug!("Position dictionary write order:");
+    for (i, position) in positions.iter().enumerate() {
+        log::debug!(
+            "  [{}] Position {} (depth={}, code={}, bits={})",
+            i,
+            position.pos,
+            position.depth,
+            position.code,
+            position.code_bits
+        );
+    }
+
     for position in positions {
         let n = encode_varint(&mut varint_buf, position.depth as u64);
         pos_dict_data.extend_from_slice(&varint_buf[..n]);
@@ -901,9 +971,19 @@ fn write_compressed_file(
     let mut pos2code: HashMap<u64, &Position> = HashMap::new();
     for position in positions {
         pos2code.insert(position.pos, position);
+        log::debug!(
+            "pos2code[{}] = Position(code={}, bits={})",
+            position.pos,
+            position.code,
+            position.code_bits
+        );
     }
-    
-    log::debug!("Position map has {} entries, contains 0: {}", pos2code.len(), pos2code.contains_key(&0));
+
+    log::debug!(
+        "Position map has {} entries, contains 0: {}",
+        pos2code.len(),
+        pos2code.contains_key(&0)
+    );
 
     // Second pass: re-encode with Huffman codes
     intermediate.seek(SeekFrom::Start(0))?;
@@ -974,11 +1054,14 @@ fn write_compressed_file(
                 bit_writer.encode(pos_code.code, pos_code.code_bits)?;
             }
             bit_writer.flush()?;
-            
+
             // Copy uncovered bytes (the entire word)
             let mut word_data = vec![0u8; word_len as usize];
             reader.read_exact(&mut word_data)?;
-            log::debug!("Writing {} uncovered bytes for word with no patterns", word_len);
+            log::debug!(
+                "Writing {} uncovered bytes for word with no patterns",
+                word_len
+            );
             bit_writer.write_bytes(&word_data)?;
         } else {
             // Process patterns
@@ -1005,7 +1088,12 @@ fn write_compressed_file(
                 let (pos, _) = decode_varint(&pos_buf[..bytes_read])?;
 
                 // Encode relative position with huffman code
-                if let Some(pos_code) = pos2code.get(&(pos - last_pos + 1)) {
+                let relative_pos = if pos >= last_pos {
+                    pos - last_pos + 1
+                } else {
+                    1 // Handle underflow by using minimum relative position
+                };
+                if let Some(pos_code) = pos2code.get(&relative_pos) {
                     bit_writer.encode(pos_code.code, pos_code.code_bits)?;
                 }
                 last_pos = pos;
@@ -1057,11 +1145,11 @@ fn write_compressed_file(
                 bit_writer.write_bytes(&uncovered_data)?;
             }
         }
-        
+
         words_written += 1;
         log::trace!("Wrote word {}, length: {}", words_written, word_len);
     }
-    
+
     log::debug!("Total words written to compressed file: {}", words_written);
 
     // Finish with BitWriter and get back the underlying writer

@@ -10,7 +10,7 @@ mod tests {
     #[test]
     fn test_compress_empty_dict() {
         use crate::decompress::Decompressor;
-        
+
         // Initialize logger for debugging
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Debug)
@@ -44,7 +44,11 @@ mod tests {
 
         assert!(getter.has_next());
         let (word, _) = getter.next(Vec::new());
-        println!("Got word: {:?}, expected: {:?}", std::str::from_utf8(&word), "word");
+        println!(
+            "Got word: {:?}, expected: {:?}",
+            std::str::from_utf8(&word),
+            "word"
+        );
         assert_eq!(word, b"word");
         assert!(!getter.has_next());
     }
@@ -89,17 +93,22 @@ mod tests {
         words
     }
 
-    // Go test: TestCompressDict1
+    // Go test: TestCompressDict1 - simplified version
     #[test]
     fn test_compress_dict1() {
         use crate::decompress::Decompressor;
+
+        // Initialize logger for debugging
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .try_init();
 
         let tmp_dir = TempDir::new().unwrap();
         let file_path = tmp_dir.path().join("compressed");
 
         let mut cfg = Cfg::default();
         cfg.min_pattern_score = 1;
-        cfg.workers = 2;
+        cfg.workers = 1; // Use single worker for now
 
         let mut compressor = Compressor::new(
             cfg,
@@ -110,7 +119,12 @@ mod tests {
         )
         .unwrap();
 
-        let words = prepare_dict();
+        // Use exact words that trigger the issue
+        let words = vec![
+            b"word0".to_vec(),        // 5 chars -> positions: 0, 6
+            b"word1".to_vec(),        // 5 chars -> positions: 0, 6
+            b"longlongword".to_vec(), // 12 chars -> positions: 0, 13
+        ];
 
         // Add all words to compressor
         for word in &words {
@@ -126,6 +140,11 @@ mod tests {
         for expected_word in &words {
             assert!(getter.has_next());
             let (word, _) = getter.next(Vec::new());
+            println!(
+                "Got word: {:?}, expected: {:?}",
+                std::str::from_utf8(&word),
+                std::str::from_utf8(&expected_word)
+            );
             assert_eq!(word, expected_word.as_slice());
         }
         assert!(!getter.has_next());

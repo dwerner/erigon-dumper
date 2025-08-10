@@ -609,7 +609,10 @@ impl RawWordsFile {
 
         // Seek to beginning
         self.f.seek(std::io::SeekFrom::Start(0))?;
-        log::debug!("RawWordsFile::for_each - starting at position 0, count: {}", self.count);
+        log::debug!(
+            "RawWordsFile::for_each - starting at position 0, count: {}",
+            self.count
+        );
 
         let mut reader = BufReader::new(&self.f);
         let mut buf = vec![0u8; 16 * 1024];
@@ -621,7 +624,10 @@ impl RawWordsFile {
             loop {
                 let mut byte = [0u8; 1];
                 if let Err(e) = reader.read_exact(&mut byte) {
-                    log::debug!("RawWordsFile::for_each - EOF or error reading varint: {:?}", e);
+                    log::debug!(
+                        "RawWordsFile::for_each - EOF or error reading varint: {:?}",
+                        e
+                    );
                     return Ok(());
                 }
                 l |= ((byte[0] & 0x7F) as u64) << shift;
@@ -640,8 +646,12 @@ impl RawWordsFile {
                 buf.resize(l as usize, 0);
             }
             reader.read_exact(&mut buf[..l as usize])?;
-            
-            log::debug!("RawWordsFile::for_each - read word of length {}, compressed: {}", l, compressed);
+
+            log::debug!(
+                "RawWordsFile::for_each - read word of length {}, compressed: {}",
+                l,
+                compressed
+            );
             walker(&buf[..l as usize], compressed)?;
         }
     }
