@@ -1052,16 +1052,16 @@ impl PositionHuffBuilder {
                     || heap.peek().unwrap().node.uses < self.positions[i].uses)
             {
                 // Take h0 from heap
-                let node = heap.pop().unwrap();
+                let mut node = heap.pop().unwrap();
+                node.node.add_zero(&mut self.positions); // AddZero AFTER pop like Go
+                h.uses += node.node.uses;
                 h.h0 = Some(node.node);
-                h.h0.as_mut().unwrap().add_zero(); // AddZero AFTER assignment like Go
-                h.uses += h.h0.as_ref().unwrap().uses;
             } else {
-                // Take p0 from list
-                h.p0 = Some(Box::new(self.positions[i].clone()));
-                h.p0.as_mut().unwrap().code = 0; // Set code 0 like Go line 593
-                h.p0.as_mut().unwrap().code_bits = 1; // Set codeBits 1 like Go line 594
-                h.uses += h.p0.as_ref().unwrap().uses;
+                // Take p0 from list - store the index
+                h.p0 = Some(i);
+                self.positions[i].code = 0; // Set code 0 like Go line 593
+                self.positions[i].code_bits = 1; // Set codeBits 1 like Go line 594
+                h.uses += self.positions[i].uses;
                 i += 1;
             }
 
@@ -1071,16 +1071,16 @@ impl PositionHuffBuilder {
                     || heap.peek().unwrap().node.uses < self.positions[i].uses)
             {
                 // Take h1 from heap
-                let node = heap.pop().unwrap();
+                let mut node = heap.pop().unwrap();
+                node.node.add_one(&mut self.positions); // AddOne AFTER pop like Go
+                h.uses += node.node.uses;
                 h.h1 = Some(node.node);
-                h.h1.as_mut().unwrap().add_one(); // AddOne AFTER assignment like Go
-                h.uses += h.h1.as_ref().unwrap().uses;
             } else {
-                // Take p1 from list
-                h.p1 = Some(Box::new(self.positions[i].clone()));
-                h.p1.as_mut().unwrap().code = 1; // Set code 1 like Go line 606
-                h.p1.as_mut().unwrap().code_bits = 1; // Set codeBits 1 like Go line 607
-                h.uses += h.p1.as_ref().unwrap().uses;
+                // Take p1 from list - store the index
+                h.p1 = Some(i);
+                self.positions[i].code = 1; // Set code 1 like Go line 606
+                self.positions[i].code_bits = 1; // Set codeBits 1 like Go line 607
+                h.uses += self.positions[i].uses;
                 i += 1;
             }
 
@@ -1090,41 +1090,7 @@ impl PositionHuffBuilder {
 
         // Set depths from root
         if let Some(mut root) = heap.pop() {
-            root.node.set_depth(0);
-            // Extract positions back with their assigned codes
-            self.extract_positions(&*root.node);
-        }
-    }
-
-    fn extract_positions(&mut self, node: &PositionHuff) {
-        // Recursively extract positions from the Huffman tree
-        // and update the positions vector with their codes
-        if let Some(ref p0) = node.p0 {
-            // Find and update the position in our list
-            for position in &mut self.positions {
-                if position.pos == p0.pos {
-                    position.code = p0.code;
-                    position.code_bits = p0.code_bits;
-                    position.depth = p0.depth;
-                    break;
-                }
-            }
-        }
-        if let Some(ref p1) = node.p1 {
-            for position in &mut self.positions {
-                if position.pos == p1.pos {
-                    position.code = p1.code;
-                    position.code_bits = p1.code_bits;
-                    position.depth = p1.depth;
-                    break;
-                }
-            }
-        }
-        if let Some(ref h0) = node.h0 {
-            self.extract_positions(h0);
-        }
-        if let Some(ref h1) = node.h1 {
-            self.extract_positions(h1);
+            root.node.set_depth(0, &mut self.positions);
         }
     }
 }

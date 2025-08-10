@@ -658,8 +658,8 @@ pub struct Position {
 
 // From Go: PositionHuff struct (for Huffman tree)
 pub struct PositionHuff {
-    pub p0: Option<Box<Position>>,
-    pub p1: Option<Box<Position>>,
+    pub p0: Option<usize>,  // Index into positions array
+    pub p1: Option<usize>,  // Index into positions array
     pub h0: Option<Box<PositionHuff>>,
     pub h1: Option<Box<PositionHuff>>,
     pub uses: u64,
@@ -667,54 +667,54 @@ pub struct PositionHuff {
 }
 
 impl PositionHuff {
-    pub fn add_zero(&mut self) {
-        if let Some(ref mut p0) = self.p0 {
-            p0.code <<= 1;
-            p0.code_bits += 1;
+    pub fn add_zero(&mut self, positions: &mut [Position]) {
+        if let Some(idx) = self.p0 {
+            positions[idx].code <<= 1;
+            positions[idx].code_bits += 1;
         } else if let Some(ref mut h0) = self.h0 {
-            h0.add_zero();
+            h0.add_zero(positions);
         }
 
-        if let Some(ref mut p1) = self.p1 {
-            p1.code <<= 1;
-            p1.code_bits += 1;
+        if let Some(idx) = self.p1 {
+            positions[idx].code <<= 1;
+            positions[idx].code_bits += 1;
         } else if let Some(ref mut h1) = self.h1 {
-            h1.add_zero();
+            h1.add_zero(positions);
         }
     }
 
-    pub fn add_one(&mut self) {
-        if let Some(ref mut p0) = self.p0 {
-            p0.code <<= 1;
-            p0.code |= 1;
-            p0.code_bits += 1;
+    pub fn add_one(&mut self, positions: &mut [Position]) {
+        if let Some(idx) = self.p0 {
+            positions[idx].code <<= 1;
+            positions[idx].code |= 1;
+            positions[idx].code_bits += 1;
         } else if let Some(ref mut h0) = self.h0 {
-            h0.add_one();
+            h0.add_one(positions);
         }
 
-        if let Some(ref mut p1) = self.p1 {
-            p1.code <<= 1;
-            p1.code |= 1;
-            p1.code_bits += 1;
+        if let Some(idx) = self.p1 {
+            positions[idx].code <<= 1;
+            positions[idx].code |= 1;
+            positions[idx].code_bits += 1;
         } else if let Some(ref mut h1) = self.h1 {
-            h1.add_one();
+            h1.add_one(positions);
         }
     }
 
-    pub fn set_depth(&mut self, depth: usize) {
-        if let Some(ref mut p0) = self.p0 {
-            p0.depth = depth + 1;
-            p0.uses = 0;
+    pub fn set_depth(&mut self, depth: usize, positions: &mut [Position]) {
+        if let Some(idx) = self.p0 {
+            positions[idx].depth = depth + 1;
+            positions[idx].uses = 0;
         }
-        if let Some(ref mut p1) = self.p1 {
-            p1.depth = depth + 1;
-            p1.uses = 0;
+        if let Some(idx) = self.p1 {
+            positions[idx].depth = depth + 1;
+            positions[idx].uses = 0;
         }
         if let Some(ref mut h0) = self.h0 {
-            h0.set_depth(depth + 1);
+            h0.set_depth(depth + 1, positions);
         }
         if let Some(ref mut h1) = self.h1 {
-            h1.set_depth(depth + 1);
+            h1.set_depth(depth + 1, positions);
         }
     }
 }
@@ -728,7 +728,7 @@ pub fn position_list_cmp(a: &Position, b: &Position) -> std::cmp::Ordering {
     match a.uses.cmp(&b.uses) {
         Ordering::Equal => {
             // When uses are equal, compare by reverse of code
-            reverse_bits_64(b.code).cmp(&reverse_bits_64(a.code))
+            reverse_bits_64(a.code).cmp(&reverse_bits_64(b.code))
         }
         other => other,
     }
