@@ -89,12 +89,20 @@ pub fn cover_word_by_patterns(
     pos_map: &mut std::collections::HashMap<u64, u64>,
 ) -> (Vec<u8>, Vec<usize>, Vec<usize>) {
     // Go: parallel_compress.go:42-179
+    
+    log::debug!("cover_word_by_patterns: input = '{}'", String::from_utf8_lossy(input));
 
     // Clear output buffer
     output.clear();
 
     // Find all pattern matches in the input
     let matches = match_finder.find_longest_matches(input);
+    
+    log::debug!("Found {} pattern matches for word", matches.len());
+    for m in &matches {
+        log::debug!("  Match at {}-{}: '{}'", m.start, m.end, 
+            String::from_utf8_lossy(&m.pattern.word));
+    }
 
     // Go: parallel_compress.go:45-48
     if matches.is_empty() {
@@ -204,13 +212,33 @@ pub fn cover_word_by_patterns(
     let mut pattern_idx = optim_cell.pattern_idx;
     while pattern_idx != 0 {
         pattern_count += 1;
+        if pattern_idx + 1 >= patterns.len() {
+            log::warn!(
+                "Pattern index out of bounds: {} >= {}",
+                pattern_idx + 1,
+                patterns.len()
+            );
+            break;
+        }
         pattern_idx = patterns[pattern_idx + 1];
+    }
+
+    if trace {
+        println!("Pattern count for word: {}", pattern_count);
     }
 
     // Write pattern count
     let mut num_buf = [0u8; 10];
     let n = encode_varint(&mut num_buf, pattern_count);
     output.extend_from_slice(&num_buf[..n]);
+
+    if trace {
+        println!(
+            "Writing pattern count: {} (bytes: {:?})",
+            pattern_count,
+            &num_buf[..n]
+        );
+    }
 
     // Write patterns and track uncovered regions
     pattern_idx = optim_cell.pattern_idx;
@@ -228,22 +256,39 @@ pub fn cover_word_by_patterns(
         }
         last_uncovered = pattern_match.end;
 
-        // Starting position
-        *pos_map
-            .entry((pattern_match.start - last_start + 1) as u64)
-            .or_insert(0) += 1;
+        // Track relative position for position map (matching Go)
+        let relative_pos = (pattern_match.start - last_start + 1) as u64;
+        *pos_map.entry(relative_pos).or_insert(0) += 1;
         last_start = pattern_match.start;
 
-        // Write position
+        // Write ABSOLUTE position to intermediate file (matching Go)
         let n = encode_varint(&mut num_buf, pattern_match.start as u64);
         output.extend_from_slice(&num_buf[..n]);
 
-        // Write pattern code
-        let n = encode_varint(&mut num_buf, pattern_match.pattern.code);
+        if trace {
+            println!(
+                "Writing pattern position: absolute={}, relative={}",
+                pattern_match.start, relative_pos
+            );
+        }
+
+        // Write pattern's SEQUENTIAL code (not Huffman code) to intermediate file
+        let n = encode_varint(&mut num_buf, pattern_match.pattern.sequential_code);
         output.extend_from_slice(&num_buf[..n]);
+
+        if trace {
+            println!(
+                "Writing pattern sequential code: {} for pattern '{}'",
+                pattern_match.pattern.sequential_code,
+                String::from_utf8_lossy(&pattern_match.pattern.word)
+            );
+        }
 
         pattern_idx = patterns[pattern_idx + 1];
     }
+
+    // Track position 0 for terminator encoding (but don't write it to intermediate file)
+    *pos_map.entry(0).or_insert(0) += 1;
 
     if input.len() > last_uncovered {
         uncovered.push(last_uncovered);
@@ -275,8 +320,8 @@ impl PatternHuffBuilder {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
-        // Sort patterns by uses (frequency) - least used first
-        self.patterns.sort_by(|a, b| a.uses.cmp(&b.uses));
+        // Patterns are already sorted before being passed to this builder
+        // Don't sort again - it would break the order!
 
         if self.patterns.is_empty() {
             return;
@@ -333,15 +378,15 @@ impl PatternHuffBuilder {
             {
                 // Take from heap
                 let mut node = heap.pop().unwrap();
-                node.node.add_zero();
+                node.node.add_zero(&mut self.patterns);
                 h.uses += node.node.uses;
                 h.h0 = Some(node.node);
             } else {
-                // Take from list
+                // Take from list - store the INDEX
                 self.patterns[i].code = 0;
                 self.patterns[i].code_bits = 1;
                 h.uses += self.patterns[i].uses;
-                h.p0 = Some(Box::new(self.patterns[i].clone()));
+                h.p0 = Some(i);
                 i += 1;
             }
 
@@ -352,15 +397,15 @@ impl PatternHuffBuilder {
             {
                 // Take from heap
                 let mut node = heap.pop().unwrap();
-                node.node.add_one();
+                node.node.add_one(&mut self.patterns);
                 h.uses += node.node.uses;
                 h.h1 = Some(node.node);
             } else {
-                // Take from list
+                // Take from list - store the INDEX
                 self.patterns[i].code = 1;
                 self.patterns[i].code_bits = 1;
                 h.uses += self.patterns[i].uses;
-                h.p1 = Some(Box::new(self.patterns[i].clone()));
+                h.p1 = Some(i);
                 i += 1;
             }
 
@@ -370,41 +415,8 @@ impl PatternHuffBuilder {
 
         // Set depths from root
         if let Some(mut root) = heap.pop() {
-            root.node.set_depth(0);
-            // Extract patterns back with their assigned codes
-            self.extract_patterns(&*root.node);
-        }
-    }
-
-    fn extract_patterns(&mut self, node: &PatternHuff) {
-        // Recursively extract patterns from the Huffman tree
-        // and update the patterns vector with their codes
-        if let Some(ref p0) = node.p0 {
-            // Find and update the pattern in our list
-            for pattern in &mut self.patterns {
-                if pattern.word == p0.word {
-                    pattern.code = p0.code;
-                    pattern.code_bits = p0.code_bits;
-                    pattern.depth = p0.depth;
-                    break;
-                }
-            }
-        }
-        if let Some(ref p1) = node.p1 {
-            for pattern in &mut self.patterns {
-                if pattern.word == p1.word {
-                    pattern.code = p1.code;
-                    pattern.code_bits = p1.code_bits;
-                    pattern.depth = p1.depth;
-                    break;
-                }
-            }
-        }
-        if let Some(ref h0) = node.h0 {
-            self.extract_patterns(h0);
-        }
-        if let Some(ref h1) = node.h1 {
-            self.extract_patterns(h1);
+            root.node.set_depth(0, &mut self.patterns);
+            // Patterns are now updated directly, no need to extract
         }
     }
 }
@@ -426,8 +438,15 @@ impl PositionHuffBuilder {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
-        // Sort positions by uses (frequency) - least used first
-        self.positions.sort_by(|a, b| a.uses.cmp(&b.uses));
+        // Sort positions by uses (frequency) - least used first, then by reverse64(code) as tiebreaker
+        // Initially, code contains the position value itself (pos)
+        self.positions.sort_by(|a, b| {
+            if a.uses == b.uses {
+                reverse_bits_64(a.code).cmp(&reverse_bits_64(b.code))
+            } else {
+                a.uses.cmp(&b.uses)
+            }
+        });
 
         log::debug!("Position list order for tree building:");
         for (i, p) in self.positions.iter().enumerate() {
@@ -587,8 +606,9 @@ pub fn compress_with_pattern_candidates(
 
     dict_builder.for_each(|score, word| {
         let mut pattern = Pattern::new(word.to_vec(), score);
-        // Don't assign codes yet - will be assigned after Huffman encoding
-        pattern.code = code2pattern.len() as u64; // Temporary sequential ID for intermediate file
+        // Assign sequential code for intermediate file (like Go does)
+        pattern.sequential_code = code2pattern.len() as u64;
+        pattern.code = pattern.sequential_code; // Initially same as sequential
         pattern.uses = 0;
         pattern.code_bits = 0;
 
@@ -598,25 +618,108 @@ pub fn compress_with_pattern_candidates(
 
     // Build Huffman codes EARLY to get consistent pattern codes
     // Count pattern uses (use score as proxy)
-    for pattern in &mut code2pattern {
+    log::debug!("Pattern dictionary BEFORE Huffman encoding:");
+    for (i, pattern) in code2pattern.iter_mut().enumerate() {
         pattern.uses = pattern.score;
-    }
-    
-    // Build Huffman codes for patterns
-    let mut pattern_huff = PatternHuffBuilder::new(code2pattern.clone());
-    pattern_huff.build_huffman_codes();
-    log::debug!("Pattern dictionary after Huffman encoding:");
-    for (i, p) in pattern_huff.patterns.iter().enumerate() {
-        log::debug!("  Pattern {}: '{}' (depth {}, score {}, code {}, bits {})", 
-            i, String::from_utf8_lossy(&p.word), p.depth, p.score, p.code, p.code_bits);
+        log::debug!(
+            "  Pattern {}: '{}' (score {}, code {})",
+            i,
+            String::from_utf8_lossy(&pattern.word),
+            pattern.score,
+            pattern.code
+        );
     }
 
-    // Update the match_finder and code2pattern with the final Huffman codes
+    // Create pattern list for Huffman encoding (separate from code2pattern)
+    // code2pattern must remain in original order for sequential code lookup!
+    let mut pattern_list: Vec<Pattern> = Vec::new();
+    for p in &code2pattern {
+        if p.uses > 0 {
+            pattern_list.push(p.clone());
+        }
+    }
+
+    // Sort pattern_list before Huffman encoding (like Go does)
+    // Sort by uses, then reverse64(sequential_code)
+    pattern_list.sort_by(|a, b| {
+        if a.uses == b.uses {
+            reverse_bits_64(a.sequential_code).cmp(&reverse_bits_64(b.sequential_code))
+        } else {
+            a.uses.cmp(&b.uses)
+        }
+    });
+
+    // Build Huffman codes for pattern_list
+    let mut pattern_huff = PatternHuffBuilder::new(pattern_list);
+    pattern_huff.build_huffman_codes();
+    let mut pattern_list = pattern_huff.patterns;
+    
+    // The Huffman tree construction already assigned the codes we need
+    // These codes are built following the same algorithm as Go
+    
+    log::debug!("Huffman codes from tree construction:");
+    for p in &pattern_list {
+        log::debug!("  '{}': depth={}, code={:b} ({}), seq_code={}",
+            String::from_utf8_lossy(&p.word),
+            p.depth,
+            p.code,
+            p.code,
+            p.sequential_code
+        );
+    }
+    
+    log::debug!("Canonical codes assigned:");
+    for p in &pattern_list {
+        log::debug!("  '{}': depth={}, code={:b} ({}), seq_code={}",
+            String::from_utf8_lossy(&p.word),
+            p.depth,
+            p.code,
+            p.code,
+            p.sequential_code
+        );
+    }
+
+    // Update code2pattern with Huffman codes (preserving original order)
+    for huffman_pattern in &pattern_list {
+        // Find pattern in original code2pattern and update its Huffman codes
+        for original in &mut code2pattern {
+            if original.sequential_code == huffman_pattern.sequential_code {
+                original.code = huffman_pattern.code;
+                original.code_bits = huffman_pattern.code_bits;
+                original.depth = huffman_pattern.depth;
+                break;
+            }
+        }
+    }
+    
+    // Sort pattern_list for dictionary writing (like Go does after Huffman encoding)
+    pattern_list.sort_by(|a, b| {
+        if a.uses == b.uses {
+            // Compare reverse64(Huffman code)
+            reverse_bits_64(a.code).cmp(&reverse_bits_64(b.code))
+        } else {
+            a.uses.cmp(&b.uses)
+        }
+    });
+
+    log::debug!("Pattern dictionary after Huffman encoding:");
+    for (i, p) in code2pattern.iter().enumerate() {
+        log::debug!(
+            "  Pattern {}: '{}' (depth {}, score {}, code {}, bits {}, seq_code {})",
+            i,
+            String::from_utf8_lossy(&p.word),
+            p.depth,
+            p.score,
+            p.code,
+            p.code_bits,
+            p.sequential_code
+        );
+    }
+
+    // Update the match_finder with Huffman codes
     match_finder = MatchFinder::new();
-    code2pattern.clear();
-    for pattern in &pattern_huff.patterns {
+    for pattern in &code2pattern {
         match_finder.insert(pattern.clone());
-        code2pattern.push(pattern.clone());
     }
 
     // Position codes will be built later after processing words
@@ -729,7 +832,7 @@ pub fn compress_with_pattern_candidates(
 
     // Go: parallel_compress.go:453-730
     // Build Huffman codes and write final compressed file
-    
+
     // Pattern Huffman codes already built earlier
     // Use the existing pattern_huff from earlier
 
@@ -739,7 +842,7 @@ pub fn compress_with_pattern_candidates(
         positions.push(Position {
             uses,
             pos: *pos,
-            code: 0,
+            code: *pos, // Initially set code = pos like Go does
             code_bits: 0,
             depth: 0,
         });
@@ -764,14 +867,14 @@ pub fn compress_with_pattern_candidates(
         );
     }
 
-    // CRITICAL: Sort positions to match Go's decompression expectations
-    // Go sorts by uses first, then by bits.Reverse64(code) as tiebreaker
-    // But the decompression recursive algorithm expects a specific order to recreate the codes
-    // Let's try sorting by the final assigned codes instead
+    // CRITICAL: The recursive decompression algorithm requires positions to be
+    // sorted properly for canonical Huffman reconstruction. While Go sorts by
+    // uses then reverse64(code), the actual dictionary write order must ensure
+    // positions are processable by the recursive algorithm.
+    // Sort by depth first (for proper grouping), then by position value
     position_huff.positions.sort_by(|a, b| {
-        // Sort by depth first (shallower first), then by code
         if a.depth == b.depth {
-            a.code.cmp(&b.code)
+            a.pos.cmp(&b.pos)
         } else {
             a.depth.cmp(&b.depth)
         }
@@ -788,10 +891,12 @@ pub fn compress_with_pattern_candidates(
     }
 
     // Write final compressed file
+    // Pass both arrays: code2pattern for sequential lookup, pattern_list for dictionary
     write_compressed_file(
         cf,
         &intermediate_path,
-        &pattern_huff.patterns,
+        &code2pattern,
+        &pattern_list,
         &position_huff.positions,
         in_count,
         empty_words_count,
@@ -925,7 +1030,8 @@ impl<W: std::io::Write> BitWriter<W> {
 fn write_compressed_file(
     cf: &mut std::fs::File,
     intermediate_path: &str,
-    patterns: &[Pattern],
+    code2pattern: &[Pattern], // Original order for sequential code lookup
+    pattern_list: &[Pattern], // Sorted order for dictionary
     positions: &[Position],
     word_count: u64,
     empty_words_count: u64,
@@ -944,7 +1050,22 @@ fn write_compressed_file(
     let mut pattern_dict_data = Vec::new();
     let mut varint_buf = [0u8; 10];
 
-    for pattern in patterns {
+    // pattern_list is already sorted for dictionary writing
+    let sorted_patterns_refs: Vec<_> = pattern_list.iter().collect();
+
+    log::debug!(
+        "Writing {} patterns to dictionary (sorted order):",
+        sorted_patterns_refs.len()
+    );
+    for (i, pattern) in sorted_patterns_refs.iter().enumerate() {
+        log::debug!(
+            "  Dict[{}]: '{}' (depth {}, code {}, seq_code {})",
+            i,
+            String::from_utf8_lossy(&pattern.word),
+            pattern.depth,
+            pattern.code,
+            pattern.sequential_code
+        );
         let n = encode_varint(&mut varint_buf, pattern.depth as u64);
         pattern_dict_data.extend_from_slice(&varint_buf[..n]);
         let n = encode_varint(&mut varint_buf, pattern.word.len() as u64);
@@ -981,11 +1102,7 @@ fn write_compressed_file(
     w.write_all(&(pos_dict_data.len() as u64).to_be_bytes())?;
     w.write_all(&pos_dict_data)?;
 
-    // Build lookup maps for codes
-    let mut code2pattern: HashMap<u64, &Pattern> = HashMap::new();
-    for pattern in patterns {
-        code2pattern.insert(pattern.code, pattern);
-    }
+    // code2pattern is already in sequential order - we can use direct array indexing
 
     let mut pos2code: HashMap<u64, &Position> = HashMap::new();
     for position in positions {
@@ -1030,9 +1147,17 @@ fn write_compressed_file(
             break; // EOF
         }
 
-        log::debug!("Read {} bytes for word length: {:02x?}", bytes_read, &len_buf[..bytes_read]);
+        log::debug!(
+            "Read {} bytes for word length: {:02x?}",
+            bytes_read,
+            &len_buf[..bytes_read]
+        );
         let (word_len, _) = decode_varint(&len_buf[..bytes_read]).map_err(|e| {
-            log::error!("Failed to decode word length varint from bytes {:02x?}: {}", &len_buf[..bytes_read], e);
+            log::error!(
+                "Failed to decode word length varint from bytes {:02x?}: {}",
+                &len_buf[..bytes_read],
+                e
+            );
             e
         })?;
 
@@ -1069,7 +1194,13 @@ fn write_compressed_file(
         }
 
         let (pattern_count, _) = decode_varint(&pattern_count_buf[..bytes_read])?;
-        log::debug!("Word {} (length {}): pattern_count = {}", words_written + 1, word_len, pattern_count);
+        log::debug!(
+            "Word {} (length {}): pattern_count = {} (bytes: {:02x?})",
+            words_written + 1,
+            word_len,
+            pattern_count,
+            &pattern_count_buf[..bytes_read]
+        );
 
         if pattern_count == 0 {
             // No patterns - word is uncompressed
@@ -1088,14 +1219,19 @@ fn write_compressed_file(
             );
             bit_writer.write_bytes(&word_data)?;
         } else {
-            // Process patterns  
-            log::debug!("Processing {} patterns for word {} (length {})", pattern_count, words_written + 1, word_len);
+            // Process patterns
+            log::debug!(
+                "Processing {} patterns for word {} (length {})",
+                pattern_count,
+                words_written + 1,
+                word_len
+            );
             let mut last_pos = 0u64;
             let mut uncovered_count = 0usize;
             let mut last_uncovered = 0usize;
 
             for i in 0..pattern_count {
-                // Read pattern position
+                // Read pattern position (ABSOLUTE position from intermediate file)
                 let mut pos_buf = [0u8; 10];
                 let mut bytes_read = 0;
 
@@ -1111,17 +1247,24 @@ fn write_compressed_file(
                 }
 
                 let (pos, _) = decode_varint(&pos_buf[..bytes_read])?;
-                log::debug!("  Pattern {}: position = {}", i, pos);
+                log::debug!("  Pattern {}: absolute position = {}", i, pos);
+
+                // Calculate relative position for encoding (matching Go: pos - lastPos + 1)
+                let relative_pos = pos - last_pos + 1;
+                log::debug!(
+                    "  Pattern {}: relative position = {} (pos {} - last_pos {} + 1)",
+                    i,
+                    relative_pos,
+                    pos,
+                    last_pos
+                );
 
                 // Encode relative position with huffman code
-                let relative_pos = if pos >= last_pos {
-                    pos - last_pos + 1
-                } else {
-                    1 // Handle underflow by using minimum relative position
-                };
                 if let Some(pos_code) = pos2code.get(&relative_pos) {
                     bit_writer.encode(pos_code.code, pos_code.code_bits)?;
                 }
+
+                // Update last position
                 last_pos = pos;
 
                 // Read pattern code
@@ -1140,34 +1283,84 @@ fn write_compressed_file(
                 }
 
                 let (pattern_code, _) = decode_varint(&code_buf[..bytes_read])?;
-                log::debug!("  Pattern {}: code = {}", i, pattern_code);
+                log::debug!(
+                    "  Pattern {}: code = {} (bytes: {:02x?})",
+                    i,
+                    pattern_code,
+                    &code_buf[..bytes_read]
+                );
 
-                // Encode pattern with huffman code
-                if let Some(pattern) = code2pattern.get(&pattern_code) {
+                // Look up pattern by sequential code which IS the array index in code2pattern!
+                if pattern_code < code2pattern.len() as u64 {
+                    let pattern = &code2pattern[pattern_code as usize];
+                    log::debug!(
+                        "  Pattern {}: sequential_code={} maps to '{}' with Huffman code={}, bits={}",
+                        i,
+                        pattern_code,
+                        String::from_utf8_lossy(&pattern.word),
+                        pattern.code,
+                        pattern.code_bits
+                    );
                     bit_writer.encode(pattern.code, pattern.code_bits)?;
-                    log::debug!("  Pattern {}: encoded pattern '{}', length = {}", i, String::from_utf8_lossy(&pattern.word), pattern.word.len());
+                    log::debug!(
+                        "  Pattern {}: encoded pattern '{}', length = {}",
+                        i,
+                        String::from_utf8_lossy(&pattern.word),
+                        pattern.word.len()
+                    );
 
-                    // Track uncovered bytes
-                    log::debug!("  Pattern {}: checking pos {} > last_uncovered {}", i, pos as usize, last_uncovered);
+                    // Track uncovered bytes (use pos not last_pos, as pos is current position)
+                    log::debug!(
+                        "  Pattern {}: checking pos {} > last_uncovered {}",
+                        i,
+                        pos as usize,
+                        last_uncovered
+                    );
                     if pos as usize > last_uncovered {
                         uncovered_count += pos as usize - last_uncovered;
-                        log::debug!("  Pattern {}: added {} uncovered bytes (pos {} > last_uncovered {})", i, pos as usize - last_uncovered, pos, last_uncovered);
+                        log::debug!(
+                            "  Pattern {}: added {} uncovered bytes (pos {} > last_uncovered {})",
+                            i,
+                            pos as usize - last_uncovered,
+                            pos,
+                            last_uncovered
+                        );
                     } else {
-                        log::debug!("  Pattern {}: no uncovered bytes added (pos {} <= last_uncovered {})", i, pos, last_uncovered);
+                        log::debug!(
+                            "  Pattern {}: no uncovered bytes added (pos {} <= last_uncovered {})",
+                            i,
+                            pos,
+                            last_uncovered
+                        );
                     }
                     last_uncovered = pos as usize + pattern.word.len();
                     log::debug!("  Pattern {}: last_uncovered now = {}", i, last_uncovered);
                 } else {
-                    log::debug!("  Pattern {}: code {} not found in dictionary!", i, pattern_code);
+                    log::debug!(
+                        "  Pattern {}: code {} not found in dictionary!",
+                        i,
+                        pattern_code
+                    );
                 }
             }
+
+            // No terminator in intermediate file - Go doesn't write one
 
             // Calculate total uncovered bytes
             if word_len as usize > last_uncovered {
                 uncovered_count += word_len as usize - last_uncovered;
-                log::debug!("  Final: added {} uncovered bytes at end (word_len {} > last_uncovered {})", word_len as usize - last_uncovered, word_len, last_uncovered);
+                log::debug!(
+                    "  Final: added {} uncovered bytes at end (word_len {} > last_uncovered {})",
+                    word_len as usize - last_uncovered,
+                    word_len,
+                    last_uncovered
+                );
             }
-            log::debug!("  Total uncovered_count: {} for word length {}", uncovered_count, word_len);
+            log::debug!(
+                "  Total uncovered_count: {} for word length {}",
+                uncovered_count,
+                word_len
+            );
 
             // Write terminating position code
             if let Some(pos_code) = pos2code.get(&0) {
@@ -1176,11 +1369,20 @@ fn write_compressed_file(
             bit_writer.flush()?;
 
             // Copy uncovered bytes
-            log::debug!("Calculated uncovered_count: {} for word {} (length {})", uncovered_count, words_written + 1, word_len);
+            log::debug!(
+                "Calculated uncovered_count: {} for word {} (length {})",
+                uncovered_count,
+                words_written + 1,
+                word_len
+            );
             if uncovered_count > 0 {
                 let mut uncovered_data = vec![0u8; uncovered_count];
                 reader.read_exact(&mut uncovered_data)?;
-                log::debug!("Read {} uncovered bytes: {:02x?}", uncovered_data.len(), &uncovered_data[..uncovered_data.len().min(10)]);
+                log::debug!(
+                    "Read {} uncovered bytes: {:02x?}",
+                    uncovered_data.len(),
+                    &uncovered_data[..uncovered_data.len().min(10)]
+                );
                 bit_writer.write_bytes(&uncovered_data)?;
             } else {
                 log::debug!("No uncovered bytes to read for word {}", words_written + 1);
@@ -1189,7 +1391,10 @@ fn write_compressed_file(
 
         words_written += 1;
         log::trace!("Wrote word {}, length: {}", words_written, word_len);
-        log::debug!("--- End of word {} processing ---", words_written);
+        log::debug!(
+            "--- End of word {} processing, moving to next word ---",
+            words_written
+        );
     }
 
     log::debug!("Total words written to compressed file: {}", words_written);

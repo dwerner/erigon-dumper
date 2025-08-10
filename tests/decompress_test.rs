@@ -282,7 +282,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
     fn test_compress_decompress_with_patterns() {
         // Initialize logger for debugging
         let _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Debug)
+            .filter_level(log::LevelFilter::Trace)
             .try_init();
         let tmp_dir = TempDir::new().unwrap();
         let file_path = tmp_dir.path().join("patterns");
@@ -296,7 +296,7 @@ excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserun
             file_path.to_string_lossy().to_string(),
             tmp_dir.path().to_string_lossy().to_string(),
             "test".to_string(),
-            log::Level::Debug,
+            log::Level::Trace,
         )
         .unwrap();
 

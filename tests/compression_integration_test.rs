@@ -5,13 +5,13 @@ mod tests {
     use erigon_dumper::compress::{Cfg, Compressor};
     use tempfile::TempDir;
 
-    #[test] 
+    #[test]
     fn test_compression_with_patterns() {
         // Initialize logger for debugging
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Debug)
             .try_init();
-            
+
         let tmp_dir = TempDir::new().unwrap();
         let output_file = tmp_dir.path().join("test.seg");
 

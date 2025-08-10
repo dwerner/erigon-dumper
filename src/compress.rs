@@ -48,12 +48,13 @@ impl Default for Cfg {
 // From Go: Pattern struct
 #[derive(Debug, Clone)]
 pub struct Pattern {
-    pub word: Vec<u8>,    // Pattern characters
-    pub score: u64,       // Score assigned to the pattern during dictionary building
+    pub word: Vec<u8>,        // Pattern characters
+    pub score: u64,           // Score assigned to the pattern during dictionary building
     pub uses: u64, // How many times this pattern has been used during search and optimisation
-    pub code: u64, // Allocated numerical code
+    pub code: u64, // Allocated numerical code (Huffman code after encoding)
     pub code_bits: usize, // Number of bits in the code
     pub depth: usize, // Depth of the pattern in the huffman tree (for encoding in the file)
+    pub sequential_code: u64, // Original sequential code (array index) for intermediate file
 }
 
 impl Pattern {
@@ -65,6 +66,7 @@ impl Pattern {
             code: 0,
             code_bits: 0,
             depth: 0,
+            sequential_code: 0,
         }
     }
 }
@@ -270,7 +272,7 @@ impl Compressor {
             ratio: 0.0,
             no_fsync: false,
             lvl,
-            trace: false,
+            trace: lvl <= log::Level::Trace,
         })
     }
 
@@ -681,8 +683,8 @@ pub struct Position {
 
 // From Go: PatternHuff struct (for Huffman tree)
 pub struct PatternHuff {
-    pub p0: Option<Box<Pattern>>,
-    pub p1: Option<Box<Pattern>>,
+    pub p0: Option<usize>, // Index into patterns array instead of owning the pattern
+    pub p1: Option<usize>, // Index into patterns array instead of owning the pattern
     pub h0: Option<Box<PatternHuff>>,
     pub h1: Option<Box<PatternHuff>>,
     pub uses: u64,
@@ -690,54 +692,56 @@ pub struct PatternHuff {
 }
 
 impl PatternHuff {
-    pub fn add_zero(&mut self) {
-        if let Some(ref mut p0) = self.p0 {
-            p0.code <<= 1;
-            p0.code_bits += 1;
+    // These methods now need access to the patterns array to update codes
+    // We'll pass the patterns array when calling these methods
+    pub fn add_zero(&mut self, patterns: &mut [Pattern]) {
+        if let Some(idx) = self.p0 {
+            patterns[idx].code <<= 1;
+            patterns[idx].code_bits += 1;
         } else if let Some(ref mut h0) = self.h0 {
-            h0.add_zero();
+            h0.add_zero(patterns);
         }
 
-        if let Some(ref mut p1) = self.p1 {
-            p1.code <<= 1;
-            p1.code_bits += 1;
+        if let Some(idx) = self.p1 {
+            patterns[idx].code <<= 1;
+            patterns[idx].code_bits += 1;
         } else if let Some(ref mut h1) = self.h1 {
-            h1.add_zero();
+            h1.add_zero(patterns);
         }
     }
 
-    pub fn add_one(&mut self) {
-        if let Some(ref mut p0) = self.p0 {
-            p0.code <<= 1;
-            p0.code |= 1;
-            p0.code_bits += 1;
+    pub fn add_one(&mut self, patterns: &mut [Pattern]) {
+        if let Some(idx) = self.p0 {
+            patterns[idx].code <<= 1;
+            patterns[idx].code |= 1;
+            patterns[idx].code_bits += 1;
         } else if let Some(ref mut h0) = self.h0 {
-            h0.add_one();
+            h0.add_one(patterns);
         }
 
-        if let Some(ref mut p1) = self.p1 {
-            p1.code <<= 1;
-            p1.code |= 1;
-            p1.code_bits += 1;
+        if let Some(idx) = self.p1 {
+            patterns[idx].code <<= 1;
+            patterns[idx].code |= 1;
+            patterns[idx].code_bits += 1;
         } else if let Some(ref mut h1) = self.h1 {
-            h1.add_one();
+            h1.add_one(patterns);
         }
     }
 
-    pub fn set_depth(&mut self, depth: usize) {
-        if let Some(ref mut p0) = self.p0 {
-            p0.depth = depth + 1;
-            p0.uses = 0;
+    pub fn set_depth(&mut self, depth: usize, patterns: &mut [Pattern]) {
+        if let Some(idx) = self.p0 {
+            patterns[idx].depth = depth + 1;
+            patterns[idx].uses = 0;
         }
-        if let Some(ref mut p1) = self.p1 {
-            p1.depth = depth + 1;
-            p1.uses = 0;
+        if let Some(idx) = self.p1 {
+            patterns[idx].depth = depth + 1;
+            patterns[idx].uses = 0;
         }
         if let Some(ref mut h0) = self.h0 {
-            h0.set_depth(depth + 1);
+            h0.set_depth(depth + 1, patterns);
         }
         if let Some(ref mut h1) = self.h1 {
-            h1.set_depth(depth + 1);
+            h1.set_depth(depth + 1, patterns);
         }
     }
 }
