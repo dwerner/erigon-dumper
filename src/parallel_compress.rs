@@ -5,77 +5,6 @@ use crate::compress::{CompressionWord, Pattern, PatternHuff, Position, PositionH
 use crate::error::CompressionError;
 use radix_trie::Trie;
 
-// From Go: CompressionQueue type
-// Go: parallel_compress.go:211
-pub type CompressionQueue = Vec<CompressionWord>;
-
-// Helper struct for pattern matching
-// Replaces patricia.MatchFinder2 from Go
-pub struct MatchFinder {
-    trie: Trie<Vec<u8>, Box<Pattern>>, // Maps pattern bytes to Pattern objects
-    patterns: Vec<Box<Pattern>>,       // Keep patterns alive
-}
-
-impl MatchFinder {
-    pub fn new() -> Self {
-        MatchFinder {
-            trie: Trie::new(),
-            patterns: Vec::new(),
-        }
-    }
-
-    pub fn insert(&mut self, pattern: Pattern) {
-        let pattern_box = Box::new(pattern);
-        let pattern_ptr = pattern_box.clone();
-        self.trie.insert(pattern_box.word.clone(), pattern_ptr);
-        self.patterns.push(pattern_box);
-    }
-
-    // Find all patterns that match starting at any position in input
-    // This is equivalent to Go's FindLongestMatches
-    pub fn find_longest_matches(&self, input: &[u8]) -> Vec<Match> {
-        let mut matches = Vec::new();
-
-        // For each starting position in input
-        for start in 0..input.len() {
-            // Check all possible pattern lengths from this position
-            for end in (start + 1)..=input.len().min(start + 128) {
-                // Max pattern len
-                if let Some(pattern) = self.trie.get(&input[start..end]) {
-                    matches.push(Match {
-                        pattern: pattern.clone(),
-                        start,
-                        end,
-                    });
-                }
-            }
-        }
-
-        // Sort matches by start position, then by length (longest first)
-        matches.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)));
-
-        // Remove overlapping shorter matches
-        let mut filtered = Vec::new();
-        let mut last_end = 0;
-
-        for m in matches {
-            if m.start >= last_end {
-                last_end = m.end;
-                filtered.push(m);
-            }
-        }
-
-        filtered
-    }
-}
-
-// Equivalent to Go's Match struct
-pub struct Match {
-    pub pattern: Box<Pattern>, // The pattern that matched
-    pub start: usize,          // Start position in input
-    pub end: usize,            // End position in input
-}
-
 // From Go: coverWordByPatterns function
 // Go: parallel_compress.go:42
 pub fn cover_word_by_patterns(
@@ -97,12 +26,6 @@ pub fn cover_word_by_patterns(
 
     // Find all pattern matches in the input
     let matches = match_finder.find_longest_matches(input);
-    
-    log::debug!("Found {} pattern matches for word", matches.len());
-    for m in &matches {
-        log::debug!("  Match at {}-{}: '{}'", m.start, m.end, 
-            String::from_utf8_lossy(&m.pattern.word));
-    }
 
     // Go: parallel_compress.go:45-48
     if matches.is_empty() {
@@ -193,19 +116,24 @@ pub fn cover_word_by_patterns(
         d.compression = max_compression;
 
         if max_include {
+            // REVIEW: missing if trace block
             d.cover_start = f.start;
             d.pattern_idx = patterns.len();
             patterns.push(i);
             patterns.push(max_cell_pattern_idx);
         } else {
+            // REVIEW: missing if trace block
             d.cover_start = max_cell_cover_start;
             d.pattern_idx = max_cell_pattern_idx;
         }
     }
 
     // Go: parallel_compress.go:129-178
+    // REVIEW: seems to diverge quite a bit from go until the end of this fn
+
     // Build output from optimal solution
     let optim_cell = cell_ring.get(0);
+    // REVIEW: missing if trace block
 
     // Count number of patterns
     let mut pattern_count = 0u64;
@@ -220,6 +148,7 @@ pub fn cover_word_by_patterns(
             );
             break;
         }
+        // REVIEW: why +1? look at go code
         pattern_idx = patterns[pattern_idx + 1];
     }
 
@@ -301,6 +230,636 @@ pub fn cover_word_by_patterns(
     }
 
     (output.clone(), patterns.clone(), uncovered.clone())
+}
+
+// REVIEW coverWordsByPatternsWorker missing - is this functionality covered? Are we doing this but
+// sync?
+
+
+
+// From Go: CompressionQueue type
+// Go: parallel_compress.go:211
+pub type CompressionQueue = Vec<CompressionWord>;
+
+// REVIEW: missing CompressionWord impl here
+
+
+// From Go: compressWithPatternCandidates function (main compression pipeline)
+// Go: parallel_compress.go:238
+pub fn compress_with_pattern_candidates(
+    trace: bool,
+    cfg: &crate::compress::Cfg,
+    log_prefix: &str,
+    segment_file_path: &str,
+    cf: &mut std::fs::File,
+    uncompressed_file: &mut crate::compress::RawWordsFile,
+    dict_builder: &crate::compress::DictionaryBuilder,
+) -> std::result::Result<(), CompressionError> {
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+
+    // Go: parallel_compress.go:243-255
+    // Build pattern dictionary and trie
+    let mut match_finder = MatchFinder::new();
+    let mut code2pattern = Vec::with_capacity(256);
+
+    dict_builder.for_each(|score, word| {
+        let mut pattern = Pattern::new(word.to_vec(), score);
+        // Assign sequential code for intermediate file (like Go does)
+        pattern.sequential_code = code2pattern.len() as u64;
+        pattern.code = pattern.sequential_code; // Initially same as sequential
+        pattern.uses = 0;
+        pattern.code_bits = 0;
+
+        match_finder.insert(pattern.clone());
+        code2pattern.push(pattern);
+    });
+
+    // REVIEW: missing trace block log
+
+
+    // REVIEW: here we diverge from go. We are building the codes early, but go does not.
+    // REVIEW: We should determine what go is doing here, (coverWordsByPatternsWorker) and using a
+    // wait group. Since we are sync, what do we do here?
+
+    // Build Huffman codes EARLY to get consistent pattern codes
+    // Count pattern uses (use score as proxy)
+    log::debug!("Pattern dictionary BEFORE Huffman encoding:");
+    for (i, pattern) in code2pattern.iter_mut().enumerate() {
+        pattern.uses = pattern.score;
+        log::debug!(
+            "  Pattern {}: '{}' (score {}, code {})",
+            i,
+            String::from_utf8_lossy(&pattern.word),
+            pattern.score,
+            pattern.code
+        );
+    }
+
+    // Create pattern list for Huffman encoding (separate from code2pattern)
+    // code2pattern must remain in original order for sequential code lookup!
+    let mut pattern_list: Vec<Pattern> = Vec::new();
+    for p in &code2pattern {
+        if p.uses > 0 {
+            pattern_list.push(p.clone());
+        }
+    }
+
+    // REVIEW: but this is not where go sorts this list. It looks like it's using files as the
+    // target for those channels? And then it collects the files up over a channel? This is a hairy
+    // area in the go code and needs a methodical approach
+    // Sort pattern_list before Huffman encoding (like Go does)
+    // Sort by uses, then reverse64(sequential_code)
+    pattern_list.sort_by(|a, b| {
+        if a.uses == b.uses {
+            reverse_bits_64(a.sequential_code).cmp(&reverse_bits_64(b.sequential_code))
+        } else {
+            a.uses.cmp(&b.uses)
+        }
+    });
+
+    // Build Huffman codes for pattern_list
+    let mut pattern_huff = PatternHuffBuilder::new(pattern_list);
+    pattern_huff.build_huffman_codes();
+    let mut pattern_list = pattern_huff.patterns;
+    
+    // The Huffman tree construction already assigned the codes we need
+    // These codes are built following the same algorithm as Go
+    
+    log::debug!("Huffman codes from tree construction:");
+    for p in &pattern_list {
+        log::debug!("  '{}': depth={}, code={:b} ({}), seq_code={}",
+            String::from_utf8_lossy(&p.word),
+            p.depth,
+            p.code,
+            p.code,
+            p.sequential_code
+        );
+    }
+    
+    log::debug!("Canonical codes assigned:");
+    for p in &pattern_list {
+        log::debug!("  '{}': depth={}, code={:b} ({}), seq_code={}",
+            String::from_utf8_lossy(&p.word),
+            p.depth,
+            p.code,
+            p.code,
+            p.sequential_code
+        );
+    }
+
+    // Update code2pattern with Huffman codes (preserving original order)
+    for huffman_pattern in &pattern_list {
+        // Find pattern in original code2pattern and update its Huffman codes
+        for original in &mut code2pattern {
+            if original.sequential_code == huffman_pattern.sequential_code {
+                original.code = huffman_pattern.code;
+                original.code_bits = huffman_pattern.code_bits;
+                original.depth = huffman_pattern.depth;
+                break;
+            }
+        }
+    }
+    
+    // Sort pattern_list for dictionary writing (like Go does after Huffman encoding)
+    // This uses pattern_list_cmp which sorts by uses, then reverse64(code)
+    pattern_list.sort_by(crate::compress::pattern_list_cmp);
+
+    log::debug!("Pattern dictionary after Huffman encoding:");
+    for (i, p) in code2pattern.iter().enumerate() {
+        log::debug!(
+            "  Pattern {}: '{}' (depth {}, score {}, code {}, bits {}, seq_code {})",
+            i,
+            String::from_utf8_lossy(&p.word),
+            p.depth,
+            p.score,
+            p.code,
+            p.code_bits,
+            p.sequential_code
+        );
+    }
+
+    // Update the match_finder with Huffman codes
+    match_finder = MatchFinder::new();
+    for pattern in &code2pattern {
+        match_finder.insert(pattern.clone());
+    }
+
+    // Position codes will be built later after processing words
+
+    if cfg.workers > 1 {
+        // Multi-worker mode not yet implemented
+        log::warn!(
+            "[{}] Multi-worker compression not yet implemented, using single worker",
+            log_prefix
+        );
+    }
+
+    // Go: parallel_compress.go:296-303
+    // Create intermediate file for first pass
+    let intermediate_path = format!("{}.tmp", segment_file_path);
+    let intermediate_file = File::create(&intermediate_path)?;
+    let mut intermediate_w = BufWriter::new(intermediate_file);
+
+    // Position map for uncompressed words
+    let mut uncomp_pos_map: HashMap<u64, u64> = HashMap::new();
+
+    // Variables for single-worker mode
+    let mut output = Vec::with_capacity(256);
+    let mut uncovered = vec![0; 256];
+    let mut patterns = Vec::with_capacity(256);
+    let mut cell_ring = Ring::new();
+
+    let mut input_size = 0u64;
+    let mut output_size = 0u64;
+    let mut in_count = 0u64;
+    let mut empty_words_count = 0u64;
+    let total_words = uncompressed_file.count;
+
+    log::debug!(
+        "[{}] Starting to process {} words from uncompressed file",
+        log_prefix,
+        total_words
+    );
+
+    // Go: parallel_compress.go:309-410
+    // Process each word
+    uncompressed_file.for_each(|v, compression| {
+        log::debug!(
+            "Processing word, len: {}, compressed: {}",
+            v.len(),
+            compression
+        );
+        in_count += 1;
+        if v.is_empty() {
+            empty_words_count += 1;
+        }
+        let word_len = v.len() as u64;
+
+        // Write length prefix
+        let mut num_buf = [0u8; 10];
+        let n = encode_varint(&mut num_buf, word_len);
+        intermediate_w.write_all(&num_buf[..n]).ok();
+
+        if word_len > 0 {
+            if compression {
+                // Go: parallel_compress.go:376
+                // Apply pattern compression
+                let (compressed, _uncovered, _patterns) = cover_word_by_patterns(
+                    trace,
+                    v,
+                    &match_finder,
+                    &mut output,
+                    &mut uncovered,
+                    &mut patterns,
+                    &mut cell_ring,
+                    &mut uncomp_pos_map,
+                );
+                intermediate_w.write_all(&compressed).ok();
+                output_size += compressed.len() as u64;
+            } else {
+                // Go: parallel_compress.go:382-388
+                // No compression - write 0 byte + raw word
+                intermediate_w.write_all(&[0]).ok();
+                intermediate_w.write_all(v).ok();
+                output_size += 1 + v.len() as u64;
+            }
+        }
+
+        input_size += 1 + word_len;
+        *uncomp_pos_map.entry(word_len + 1).or_insert(0) += 1;
+        *uncomp_pos_map.entry(0).or_insert(0) += 1;
+
+        // Progress logging
+        if in_count % 100000 == 0 {
+            log::trace!(
+                "[{}] Compression preprocessing: {:.2}%",
+                log_prefix,
+                100.0 * in_count as f64 / total_words as f64
+            );
+        }
+
+        Ok(())
+    })?;
+
+    // Flush intermediate file
+    intermediate_w.flush()?;
+    drop(intermediate_w);
+
+    log::debug!(
+        "[{}] Intermediate file written, processing {} words, {} empty",
+        log_prefix,
+        in_count,
+        empty_words_count
+    );
+
+    // Go: parallel_compress.go:453-730
+    // Build Huffman codes and write final compressed file
+
+    // Pattern Huffman codes already built earlier
+    // Use the existing pattern_huff from earlier
+
+    // Build Huffman codes for positions
+    let mut positions = Vec::new();
+    for (pos, &uses) in &uncomp_pos_map {
+        positions.push(Position {
+            uses,
+            pos: *pos,
+            code: *pos, // Initially set code = pos like Go does
+            code_bits: 0,
+            depth: 0,
+        });
+    }
+    log::debug!(
+        "Building position huffman codes for {} positions",
+        positions.len()
+    );
+    for p in &positions {
+        log::debug!("  Position {} with {} uses", p.pos, p.uses);
+    }
+    let mut position_huff = PositionHuffBuilder::new(positions);
+    position_huff.build_huffman_codes();
+    log::debug!("After huffman building:");
+    for p in &position_huff.positions {
+        log::debug!(
+            "  Position {}: depth={}, code={}, bits={}",
+            p.pos,
+            p.depth,
+            p.code,
+            p.code_bits
+        );
+    }
+
+    // Sort positions by depth first (for proper grouping), then by position value
+    // This ensures the decoder's recursive algorithm can process them correctly
+    position_huff.positions.sort_by(|a, b| {
+        if a.depth == b.depth {
+            a.pos.cmp(&b.pos)
+        } else {
+            a.depth.cmp(&b.depth)
+        }
+    });
+    
+    log::debug!("After final position sorting for dictionary:");
+    for p in &position_huff.positions {
+        log::debug!(
+            "  Position {}: depth={}, code={}, bits={}",
+            p.pos,
+            p.depth,
+            p.code,
+            p.code_bits
+        );
+    }
+
+    // Write final compressed file
+    // Pass both arrays: code2pattern for sequential lookup, pattern_list for dictionary
+    write_compressed_file(
+        cf,
+        &intermediate_path,
+        &code2pattern,
+        &pattern_list,
+        &position_huff.positions,
+        in_count,
+        empty_words_count,
+    )?;
+
+    // Clean up intermediate file
+    std::fs::remove_file(&intermediate_path).ok();
+
+    log::info!(
+        "[{}] Compression complete: input_size={}, output_size={}, ratio={:.2}",
+        log_prefix,
+        input_size,
+        output_size,
+        input_size as f64 / output_size as f64
+    );
+
+    Ok(())
+}
+
+// REVIEW: why not extract patterns in many superstrings? why use this new function?
+
+// Extract patterns from a single superstring (for synchronous processing)
+pub fn extract_patterns_from_single_superstring(
+    superstring: &[u8],
+    cfg: &crate::compress::Cfg,
+) -> Vec<Pattern> {
+    use cdivsufsort::sort_in_place;
+    use std::collections::HashMap;
+
+    let mut pattern_map: HashMap<Vec<u8>, u64> = HashMap::new();
+    let min_pattern_len = cfg.min_pattern_len;
+    let max_pattern_len = cfg.max_pattern_len;
+    let min_pattern_score = cfg.min_pattern_score;
+
+    if superstring.is_empty() {
+        return Vec::new();
+    }
+
+    // Build suffix array using divsufsort
+    let mut sa = vec![0i32; superstring.len()];
+    sort_in_place(superstring, &mut sa);
+
+    // Filter out suffixes that start with odd positions
+    let n = sa.len() / 2;
+    let mut filtered = Vec::with_capacity(n);
+    for &pos in &sa {
+        if pos & 1 == 0 {
+            filtered.push(pos >> 1); // Divide by 2 to get actual position
+        }
+    }
+
+    // Build LCP array
+    let lcp = build_lcp_array(superstring, &filtered);
+
+    // Extract patterns based on LCP
+    for i in 1..filtered.len() {
+        let common_len = lcp[i] as usize;
+        if common_len >= min_pattern_len {
+            let start = (filtered[i] * 2) as usize;
+            let end = (start + common_len * 2).min(superstring.len());
+            
+            // Extract the pattern (removing encoding)
+            let mut pattern = Vec::new();
+            let mut j = start;
+            while j < end && pattern.len() < max_pattern_len {
+                if j + 1 < superstring.len() && superstring[j] == 0x01 {
+                    pattern.push(superstring[j + 1]);
+                    j += 2;
+                } else if superstring[j] == 0x00 && j + 1 < superstring.len() && superstring[j + 1] == 0x00 {
+                    break; // End of word marker
+                } else {
+                    break;
+                }
+            }
+            
+            if pattern.len() >= min_pattern_len && pattern.len() <= max_pattern_len {
+                *pattern_map.entry(pattern).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Convert to Pattern objects with scores
+    pattern_map
+        .into_iter()
+        .filter_map(|(word, count)| {
+            let score = count * word.len() as u64;
+            if score >= min_pattern_score {
+                Some(Pattern::new(word, score))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub fn extract_patterns_in_superstrings(
+    superstrings: Vec<Vec<u8>>,
+    cfg: &crate::compress::Cfg,
+) -> Vec<Pattern> {
+    // Aggregate patterns from all superstrings
+    use std::collections::HashMap;
+    let mut all_patterns: HashMap<Vec<u8>, u64> = HashMap::new();
+    
+    for superstring in &superstrings {
+        let patterns = extract_patterns_from_single_superstring(superstring, cfg);
+        for pattern in patterns {
+            *all_patterns.entry(pattern.word).or_insert(0) += pattern.score;
+        }
+    }
+    
+    // Convert to Pattern objects
+    all_patterns
+        .into_iter()
+        .map(|(word, score)| Pattern::new(word, score))
+        .collect()
+}
+
+// Original full implementation (kept for reference but not used)
+fn _extract_patterns_in_superstrings_old(
+    superstrings: Vec<Vec<u8>>,
+    cfg: &crate::compress::Cfg,
+) -> Vec<Pattern> {
+    // Go: parallel_compress.go:744-824
+    use cdivsufsort::sort_in_place;
+    use std::collections::HashMap;
+
+    let mut pattern_map: HashMap<Vec<u8>, u64> = HashMap::new();
+    let min_pattern_len = cfg.min_pattern_len;
+    let max_pattern_len = cfg.max_pattern_len;
+    let min_pattern_score = cfg.min_pattern_score;
+
+    for superstring in superstrings {
+        if superstring.is_empty() {
+            continue;
+        }
+
+        // Build suffix array using divsufsort
+        // Go: parallel_compress.go:764
+        let mut sa = vec![0i32; superstring.len()];
+        sort_in_place(&superstring, &mut sa);
+
+        // Filter out suffixes that start with odd positions
+        // Go: parallel_compress.go:769-778
+        let n = sa.len() / 2;
+        let mut filtered = Vec::with_capacity(n);
+        for &pos in &sa {
+            if pos & 1 == 0 {
+                filtered.push(pos >> 1); // Divide by 2 to get actual position
+            }
+        }
+
+        // Build inverse suffix array
+        // Go: parallel_compress.go:779-787
+        let mut inv = vec![0i32; filtered.len()];
+        for (i, &pos) in filtered.iter().enumerate() {
+            if (pos as usize) < inv.len() {
+                inv[pos as usize] = i as i32;
+            }
+        }
+
+        // Compute LCP array using Kasai's algorithm
+        // Go: parallel_compress.go:789-823
+        let mut lcp = vec![0i32; filtered.len()];
+        let mut k = 0;
+
+        for i in 0..filtered.len() {
+            if inv[i] == (filtered.len() - 1) as i32 {
+                k = 0;
+                lcp[inv[i] as usize] = 0;
+                continue;
+            }
+
+            let j = filtered[(inv[i] + 1) as usize] as usize;
+            let i_pos = i;
+
+            // Compare characters at positions i+k and j+k
+            // Go: parallel_compress.go:814
+            while i_pos + k < filtered.len()
+                && j + k < filtered.len()
+                && i_pos * 2 + k * 2 < superstring.len()
+                && j * 2 + k * 2 < superstring.len()
+                && superstring[i_pos * 2 + k * 2] != 0
+                && superstring[j * 2 + k * 2] != 0
+                && superstring[i_pos * 2 + k * 2 + 1] == superstring[j * 2 + k * 2 + 1]
+            {
+                k += 1;
+            }
+
+            lcp[inv[i] as usize] = k as i32;
+
+            if k > 0 {
+                k -= 1;
+            }
+        }
+
+        // Extract patterns based on LCP values
+        // Patterns are substrings that appear multiple times (LCP > 0)
+        // and meet length and score requirements
+        for i in 0..lcp.len() {
+            let prefix_len = lcp[i] as usize;
+
+            if prefix_len >= min_pattern_len && prefix_len <= max_pattern_len {
+                let pos = filtered[i] as usize;
+
+                // Extract the pattern bytes from the superstring
+                // Remember: superstring uses 2 bytes per character
+                let mut pattern_bytes = Vec::with_capacity(prefix_len);
+                for j in 0..prefix_len {
+                    if pos * 2 + j * 2 + 1 < superstring.len() {
+                        pattern_bytes.push(superstring[pos * 2 + j * 2 + 1]);
+                    }
+                }
+
+                // Increment score for this pattern
+                *pattern_map.entry(pattern_bytes).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Convert to Pattern objects and filter by score
+    let mut patterns = Vec::new();
+    for (word, score) in pattern_map {
+        if score >= min_pattern_score {
+            patterns.push(Pattern::new(word, score));
+        }
+    }
+
+    patterns
+}
+
+// REVIEW: missing DictionaryBuilderFromCollector
+
+// REVIEW: missing PersistDictionary
+
+// REVIEW: missing ReadSimpleFile
+
+// Helper struct for pattern matching
+// Replaces patricia.MatchFinder2 from Go
+pub struct MatchFinder {
+    trie: Trie<Vec<u8>, Box<Pattern>>, // Maps pattern bytes to Pattern objects
+    patterns: Vec<Box<Pattern>>,       // Keep patterns alive
+}
+
+impl MatchFinder {
+    pub fn new() -> Self {
+        MatchFinder {
+            trie: Trie::new(),
+            patterns: Vec::new(),
+        }
+    }
+
+    pub fn insert(&mut self, pattern: Pattern) {
+        let pattern_box = Box::new(pattern);
+        let pattern_ptr = pattern_box.clone();
+        self.trie.insert(pattern_box.word.clone(), pattern_ptr);
+        self.patterns.push(pattern_box);
+    }
+
+    // Find all patterns that match starting at any position in input
+    // This is equivalent to Go's FindLongestMatches
+    pub fn find_longest_matches(&self, input: &[u8]) -> Vec<Match> {
+        let mut matches = Vec::new();
+
+        // For each starting position in input
+        for start in 0..input.len() {
+            // Check all possible pattern lengths from this position
+            for end in (start + 1)..=input.len().min(start + 128) {
+                // Max pattern len
+                if let Some(pattern) = self.trie.get(&input[start..end]) {
+                    matches.push(Match {
+                        pattern: pattern.clone(),
+                        start,
+                        end,
+                    });
+                }
+            }
+        }
+
+        // Sort matches by start position, then by length (longest first)
+        matches.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)));
+
+        // Remove overlapping shorter matches
+        let mut filtered = Vec::new();
+        let mut last_end = 0;
+
+        for m in matches {
+            if m.start >= last_end {
+                last_end = m.end;
+                filtered.push(m);
+            }
+        }
+
+        filtered
+    }
+}
+
+// Equivalent to Go's Match struct
+pub struct Match {
+    pub pattern: Box<Pattern>, // The pattern that matched
+    pub start: usize,          // Start position in input
+    pub end: usize,            // End position in input
 }
 
 // From Go: Huffman tree building for patterns
@@ -584,329 +1143,6 @@ impl PositionHuffBuilder {
     }
 }
 
-// From Go: compressWithPatternCandidates function (main compression pipeline)
-// Go: parallel_compress.go:238
-pub fn compress_with_pattern_candidates(
-    trace: bool,
-    cfg: &crate::compress::Cfg,
-    log_prefix: &str,
-    segment_file_path: &str,
-    cf: &mut std::fs::File,
-    uncompressed_file: &mut crate::compress::RawWordsFile,
-    dict_builder: &crate::compress::DictionaryBuilder,
-) -> std::result::Result<(), CompressionError> {
-    use std::collections::HashMap;
-    use std::fs::File;
-    use std::io::{BufWriter, Write};
-
-    // Go: parallel_compress.go:243-255
-    // Build pattern dictionary and trie
-    let mut match_finder = MatchFinder::new();
-    let mut code2pattern = Vec::with_capacity(256);
-
-    dict_builder.for_each(|score, word| {
-        let mut pattern = Pattern::new(word.to_vec(), score);
-        // Assign sequential code for intermediate file (like Go does)
-        pattern.sequential_code = code2pattern.len() as u64;
-        pattern.code = pattern.sequential_code; // Initially same as sequential
-        pattern.uses = 0;
-        pattern.code_bits = 0;
-
-        match_finder.insert(pattern.clone());
-        code2pattern.push(pattern);
-    });
-
-    // Build Huffman codes EARLY to get consistent pattern codes
-    // Count pattern uses (use score as proxy)
-    log::debug!("Pattern dictionary BEFORE Huffman encoding:");
-    for (i, pattern) in code2pattern.iter_mut().enumerate() {
-        pattern.uses = pattern.score;
-        log::debug!(
-            "  Pattern {}: '{}' (score {}, code {})",
-            i,
-            String::from_utf8_lossy(&pattern.word),
-            pattern.score,
-            pattern.code
-        );
-    }
-
-    // Create pattern list for Huffman encoding (separate from code2pattern)
-    // code2pattern must remain in original order for sequential code lookup!
-    let mut pattern_list: Vec<Pattern> = Vec::new();
-    for p in &code2pattern {
-        if p.uses > 0 {
-            pattern_list.push(p.clone());
-        }
-    }
-
-    // Sort pattern_list before Huffman encoding (like Go does)
-    // Sort by uses, then reverse64(sequential_code)
-    pattern_list.sort_by(|a, b| {
-        if a.uses == b.uses {
-            reverse_bits_64(a.sequential_code).cmp(&reverse_bits_64(b.sequential_code))
-        } else {
-            a.uses.cmp(&b.uses)
-        }
-    });
-
-    // Build Huffman codes for pattern_list
-    let mut pattern_huff = PatternHuffBuilder::new(pattern_list);
-    pattern_huff.build_huffman_codes();
-    let mut pattern_list = pattern_huff.patterns;
-    
-    // The Huffman tree construction already assigned the codes we need
-    // These codes are built following the same algorithm as Go
-    
-    log::debug!("Huffman codes from tree construction:");
-    for p in &pattern_list {
-        log::debug!("  '{}': depth={}, code={:b} ({}), seq_code={}",
-            String::from_utf8_lossy(&p.word),
-            p.depth,
-            p.code,
-            p.code,
-            p.sequential_code
-        );
-    }
-    
-    log::debug!("Canonical codes assigned:");
-    for p in &pattern_list {
-        log::debug!("  '{}': depth={}, code={:b} ({}), seq_code={}",
-            String::from_utf8_lossy(&p.word),
-            p.depth,
-            p.code,
-            p.code,
-            p.sequential_code
-        );
-    }
-
-    // Update code2pattern with Huffman codes (preserving original order)
-    for huffman_pattern in &pattern_list {
-        // Find pattern in original code2pattern and update its Huffman codes
-        for original in &mut code2pattern {
-            if original.sequential_code == huffman_pattern.sequential_code {
-                original.code = huffman_pattern.code;
-                original.code_bits = huffman_pattern.code_bits;
-                original.depth = huffman_pattern.depth;
-                break;
-            }
-        }
-    }
-    
-    // Sort pattern_list for dictionary writing (like Go does after Huffman encoding)
-    // This uses pattern_list_cmp which sorts by uses, then reverse64(code)
-    pattern_list.sort_by(crate::compress::pattern_list_cmp);
-
-    log::debug!("Pattern dictionary after Huffman encoding:");
-    for (i, p) in code2pattern.iter().enumerate() {
-        log::debug!(
-            "  Pattern {}: '{}' (depth {}, score {}, code {}, bits {}, seq_code {})",
-            i,
-            String::from_utf8_lossy(&p.word),
-            p.depth,
-            p.score,
-            p.code,
-            p.code_bits,
-            p.sequential_code
-        );
-    }
-
-    // Update the match_finder with Huffman codes
-    match_finder = MatchFinder::new();
-    for pattern in &code2pattern {
-        match_finder.insert(pattern.clone());
-    }
-
-    // Position codes will be built later after processing words
-
-    if cfg.workers > 1 {
-        // Multi-worker mode not yet implemented
-        log::warn!(
-            "[{}] Multi-worker compression not yet implemented, using single worker",
-            log_prefix
-        );
-    }
-
-    // Go: parallel_compress.go:296-303
-    // Create intermediate file for first pass
-    let intermediate_path = format!("{}.tmp", segment_file_path);
-    let intermediate_file = File::create(&intermediate_path)?;
-    let mut intermediate_w = BufWriter::new(intermediate_file);
-
-    // Position map for uncompressed words
-    let mut uncomp_pos_map: HashMap<u64, u64> = HashMap::new();
-
-    // Variables for single-worker mode
-    let mut output = Vec::with_capacity(256);
-    let mut uncovered = vec![0; 256];
-    let mut patterns = Vec::with_capacity(256);
-    let mut cell_ring = Ring::new();
-
-    let mut input_size = 0u64;
-    let mut output_size = 0u64;
-    let mut in_count = 0u64;
-    let mut empty_words_count = 0u64;
-    let total_words = uncompressed_file.count;
-
-    log::debug!(
-        "[{}] Starting to process {} words from uncompressed file",
-        log_prefix,
-        total_words
-    );
-
-    // Go: parallel_compress.go:309-410
-    // Process each word
-    uncompressed_file.for_each(|v, compression| {
-        log::debug!(
-            "Processing word, len: {}, compressed: {}",
-            v.len(),
-            compression
-        );
-        in_count += 1;
-        if v.is_empty() {
-            empty_words_count += 1;
-        }
-        let word_len = v.len() as u64;
-
-        // Write length prefix
-        let mut num_buf = [0u8; 10];
-        let n = encode_varint(&mut num_buf, word_len);
-        intermediate_w.write_all(&num_buf[..n]).ok();
-
-        if word_len > 0 {
-            if compression {
-                // Go: parallel_compress.go:376
-                // Apply pattern compression
-                let (compressed, _uncovered, _patterns) = cover_word_by_patterns(
-                    trace,
-                    v,
-                    &match_finder,
-                    &mut output,
-                    &mut uncovered,
-                    &mut patterns,
-                    &mut cell_ring,
-                    &mut uncomp_pos_map,
-                );
-                intermediate_w.write_all(&compressed).ok();
-                output_size += compressed.len() as u64;
-            } else {
-                // Go: parallel_compress.go:382-388
-                // No compression - write 0 byte + raw word
-                intermediate_w.write_all(&[0]).ok();
-                intermediate_w.write_all(v).ok();
-                output_size += 1 + v.len() as u64;
-            }
-        }
-
-        input_size += 1 + word_len;
-        *uncomp_pos_map.entry(word_len + 1).or_insert(0) += 1;
-        *uncomp_pos_map.entry(0).or_insert(0) += 1;
-
-        // Progress logging
-        if in_count % 100000 == 0 {
-            log::trace!(
-                "[{}] Compression preprocessing: {:.2}%",
-                log_prefix,
-                100.0 * in_count as f64 / total_words as f64
-            );
-        }
-
-        Ok(())
-    })?;
-
-    // Flush intermediate file
-    intermediate_w.flush()?;
-    drop(intermediate_w);
-
-    log::debug!(
-        "[{}] Intermediate file written, processing {} words, {} empty",
-        log_prefix,
-        in_count,
-        empty_words_count
-    );
-
-    // Go: parallel_compress.go:453-730
-    // Build Huffman codes and write final compressed file
-
-    // Pattern Huffman codes already built earlier
-    // Use the existing pattern_huff from earlier
-
-    // Build Huffman codes for positions
-    let mut positions = Vec::new();
-    for (pos, &uses) in &uncomp_pos_map {
-        positions.push(Position {
-            uses,
-            pos: *pos,
-            code: *pos, // Initially set code = pos like Go does
-            code_bits: 0,
-            depth: 0,
-        });
-    }
-    log::debug!(
-        "Building position huffman codes for {} positions",
-        positions.len()
-    );
-    for p in &positions {
-        log::debug!("  Position {} with {} uses", p.pos, p.uses);
-    }
-    let mut position_huff = PositionHuffBuilder::new(positions);
-    position_huff.build_huffman_codes();
-    log::debug!("After huffman building:");
-    for p in &position_huff.positions {
-        log::debug!(
-            "  Position {}: depth={}, code={}, bits={}",
-            p.pos,
-            p.depth,
-            p.code,
-            p.code_bits
-        );
-    }
-
-    // Sort positions by depth first (for proper grouping), then by position value
-    // This ensures the decoder's recursive algorithm can process them correctly
-    position_huff.positions.sort_by(|a, b| {
-        if a.depth == b.depth {
-            a.pos.cmp(&b.pos)
-        } else {
-            a.depth.cmp(&b.depth)
-        }
-    });
-    
-    log::debug!("After final position sorting for dictionary:");
-    for p in &position_huff.positions {
-        log::debug!(
-            "  Position {}: depth={}, code={}, bits={}",
-            p.pos,
-            p.depth,
-            p.code,
-            p.code_bits
-        );
-    }
-
-    // Write final compressed file
-    // Pass both arrays: code2pattern for sequential lookup, pattern_list for dictionary
-    write_compressed_file(
-        cf,
-        &intermediate_path,
-        &code2pattern,
-        &pattern_list,
-        &position_huff.positions,
-        in_count,
-        empty_words_count,
-    )?;
-
-    // Clean up intermediate file
-    std::fs::remove_file(&intermediate_path).ok();
-
-    log::info!(
-        "[{}] Compression complete: input_size={}, output_size={}, ratio={:.2}",
-        log_prefix,
-        input_size,
-        output_size,
-        input_size as f64 / output_size as f64
-    );
-
-    Ok(())
-}
 
 // Helper to reverse bits (matches Go's bits.Reverse64)
 fn reverse_bits_64(code: u64) -> u64 {
@@ -1463,214 +1699,7 @@ fn build_lcp_array(text: &[u8], sa: &[i32]) -> Vec<i32> {
     lcp
 }
 
-// Extract patterns from a single superstring (for synchronous processing)
-pub fn extract_patterns_from_single_superstring(
-    superstring: &[u8],
-    cfg: &crate::compress::Cfg,
-) -> Vec<Pattern> {
-    use cdivsufsort::sort_in_place;
-    use std::collections::HashMap;
 
-    let mut pattern_map: HashMap<Vec<u8>, u64> = HashMap::new();
-    let min_pattern_len = cfg.min_pattern_len;
-    let max_pattern_len = cfg.max_pattern_len;
-    let min_pattern_score = cfg.min_pattern_score;
-
-    if superstring.is_empty() {
-        return Vec::new();
-    }
-
-    // Build suffix array using divsufsort
-    let mut sa = vec![0i32; superstring.len()];
-    sort_in_place(superstring, &mut sa);
-
-    // Filter out suffixes that start with odd positions
-    let n = sa.len() / 2;
-    let mut filtered = Vec::with_capacity(n);
-    for &pos in &sa {
-        if pos & 1 == 0 {
-            filtered.push(pos >> 1); // Divide by 2 to get actual position
-        }
-    }
-
-    // Build LCP array
-    let lcp = build_lcp_array(superstring, &filtered);
-
-    // Extract patterns based on LCP
-    for i in 1..filtered.len() {
-        let common_len = lcp[i] as usize;
-        if common_len >= min_pattern_len {
-            let start = (filtered[i] * 2) as usize;
-            let end = (start + common_len * 2).min(superstring.len());
-            
-            // Extract the pattern (removing encoding)
-            let mut pattern = Vec::new();
-            let mut j = start;
-            while j < end && pattern.len() < max_pattern_len {
-                if j + 1 < superstring.len() && superstring[j] == 0x01 {
-                    pattern.push(superstring[j + 1]);
-                    j += 2;
-                } else if superstring[j] == 0x00 && j + 1 < superstring.len() && superstring[j + 1] == 0x00 {
-                    break; // End of word marker
-                } else {
-                    break;
-                }
-            }
-            
-            if pattern.len() >= min_pattern_len && pattern.len() <= max_pattern_len {
-                *pattern_map.entry(pattern).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Convert to Pattern objects with scores
-    pattern_map
-        .into_iter()
-        .filter_map(|(word, count)| {
-            let score = count * word.len() as u64;
-            if score >= min_pattern_score {
-                Some(Pattern::new(word, score))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-pub fn extract_patterns_in_superstrings(
-    superstrings: Vec<Vec<u8>>,
-    cfg: &crate::compress::Cfg,
-) -> Vec<Pattern> {
-    // Aggregate patterns from all superstrings
-    use std::collections::HashMap;
-    let mut all_patterns: HashMap<Vec<u8>, u64> = HashMap::new();
-    
-    for superstring in &superstrings {
-        let patterns = extract_patterns_from_single_superstring(superstring, cfg);
-        for pattern in patterns {
-            *all_patterns.entry(pattern.word).or_insert(0) += pattern.score;
-        }
-    }
-    
-    // Convert to Pattern objects
-    all_patterns
-        .into_iter()
-        .map(|(word, score)| Pattern::new(word, score))
-        .collect()
-}
-
-// Original full implementation (kept for reference but not used)
-fn _extract_patterns_in_superstrings_old(
-    superstrings: Vec<Vec<u8>>,
-    cfg: &crate::compress::Cfg,
-) -> Vec<Pattern> {
-    // Go: parallel_compress.go:744-824
-    use cdivsufsort::sort_in_place;
-    use std::collections::HashMap;
-
-    let mut pattern_map: HashMap<Vec<u8>, u64> = HashMap::new();
-    let min_pattern_len = cfg.min_pattern_len;
-    let max_pattern_len = cfg.max_pattern_len;
-    let min_pattern_score = cfg.min_pattern_score;
-
-    for superstring in superstrings {
-        if superstring.is_empty() {
-            continue;
-        }
-
-        // Build suffix array using divsufsort
-        // Go: parallel_compress.go:764
-        let mut sa = vec![0i32; superstring.len()];
-        sort_in_place(&superstring, &mut sa);
-
-        // Filter out suffixes that start with odd positions
-        // Go: parallel_compress.go:769-778
-        let n = sa.len() / 2;
-        let mut filtered = Vec::with_capacity(n);
-        for &pos in &sa {
-            if pos & 1 == 0 {
-                filtered.push(pos >> 1); // Divide by 2 to get actual position
-            }
-        }
-
-        // Build inverse suffix array
-        // Go: parallel_compress.go:779-787
-        let mut inv = vec![0i32; filtered.len()];
-        for (i, &pos) in filtered.iter().enumerate() {
-            if (pos as usize) < inv.len() {
-                inv[pos as usize] = i as i32;
-            }
-        }
-
-        // Compute LCP array using Kasai's algorithm
-        // Go: parallel_compress.go:789-823
-        let mut lcp = vec![0i32; filtered.len()];
-        let mut k = 0;
-
-        for i in 0..filtered.len() {
-            if inv[i] == (filtered.len() - 1) as i32 {
-                k = 0;
-                lcp[inv[i] as usize] = 0;
-                continue;
-            }
-
-            let j = filtered[(inv[i] + 1) as usize] as usize;
-            let i_pos = i;
-
-            // Compare characters at positions i+k and j+k
-            // Go: parallel_compress.go:814
-            while i_pos + k < filtered.len()
-                && j + k < filtered.len()
-                && i_pos * 2 + k * 2 < superstring.len()
-                && j * 2 + k * 2 < superstring.len()
-                && superstring[i_pos * 2 + k * 2] != 0
-                && superstring[j * 2 + k * 2] != 0
-                && superstring[i_pos * 2 + k * 2 + 1] == superstring[j * 2 + k * 2 + 1]
-            {
-                k += 1;
-            }
-
-            lcp[inv[i] as usize] = k as i32;
-
-            if k > 0 {
-                k -= 1;
-            }
-        }
-
-        // Extract patterns based on LCP values
-        // Patterns are substrings that appear multiple times (LCP > 0)
-        // and meet length and score requirements
-        for i in 0..lcp.len() {
-            let prefix_len = lcp[i] as usize;
-
-            if prefix_len >= min_pattern_len && prefix_len <= max_pattern_len {
-                let pos = filtered[i] as usize;
-
-                // Extract the pattern bytes from the superstring
-                // Remember: superstring uses 2 bytes per character
-                let mut pattern_bytes = Vec::with_capacity(prefix_len);
-                for j in 0..prefix_len {
-                    if pos * 2 + j * 2 + 1 < superstring.len() {
-                        pattern_bytes.push(superstring[pos * 2 + j * 2 + 1]);
-                    }
-                }
-
-                // Increment score for this pattern
-                *pattern_map.entry(pattern_bytes).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Convert to Pattern objects and filter by score
-    let mut patterns = Vec::new();
-    for (word, score) in pattern_map {
-        if score >= min_pattern_score {
-            patterns.push(Pattern::new(word, score));
-        }
-    }
-
-    patterns
-}
 
 // From Go: Worker pool for parallel compression
 // Go: parallel_compress.go:181
