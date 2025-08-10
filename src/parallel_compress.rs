@@ -519,15 +519,10 @@ pub fn compress_with_pattern_candidates(
         );
     }
 
-    // Sort positions by depth first (for proper grouping), then by position value
-    // This ensures the decoder's recursive algorithm can process them correctly
-    position_huff.positions.sort_by(|a, b| {
-        if a.depth == b.depth {
-            a.pos.cmp(&b.pos)
-        } else {
-            a.depth.cmp(&b.depth)
-        }
-    });
+    // Sort positions for dictionary writing using position_list_cmp
+    // This matches Go's behavior (line 632 in parallel_compress.go)
+    // The sort takes into account the Huffman codes that were just assigned
+    position_huff.positions.sort_by(crate::compress::position_list_cmp);
 
     log::debug!("After final position sorting for dictionary:");
     for p in &position_huff.positions {
