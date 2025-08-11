@@ -143,6 +143,23 @@ impl IndexReader {
     pub fn is_enum(&self) -> bool {
         self.enum_index
     }
+
+    /// Get the base data ID for enum indexes
+    pub fn base_data_id(&self) -> u64 {
+        self.base_data_id
+    }
+
+    /// Ordinal lookup - returns offset for i-th element (0-based)
+    /// This is what Erigon uses for headers
+    pub fn ordinal_lookup(&self, ordinal: u64) -> Option<u64> {
+        if self.enum_index {
+            // For enum indexes, ordinal is the direct index
+            self.lookup_enum(ordinal)
+        } else {
+            // For non-enum indexes, would need different handling
+            None
+        }
+    }
 }
 
 /// Helper for reading from index file buffers

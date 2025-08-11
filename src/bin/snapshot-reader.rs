@@ -1,306 +1,280 @@
-use clap::{Parser, Subcommand};
-use erigon_dumper::snapshots::{HeadersReader, IndexReader, Result, SnapshotError};
-use std::path::{Path, PathBuf};
+use alloy_consensus::Header;
+use alloy_rlp::Decodable;
+use erigon_dumper::decompress::Decompressor;
+use erigon_dumper::snapshots::recsplit::RecSplitIndex;
+use std::path::Path;
 
-#[derive(Parser)]
-#[command(name = "snapshot-reader")]
-#[command(about = "Read and inspect Erigon snapshot files", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-
-    /// Enable debug logging
-    #[arg(short, long)]
-    debug: bool,
+struct SnapshotReader {
+    headers_seg: Decompressor,
+    headers_idx: RecSplitIndex,
+    bodies_seg: Decompressor,
+    bodies_idx: RecSplitIndex,
+    transactions_seg: Decompressor,
+    transactions_idx: RecSplitIndex,
+    tx_to_block_idx: RecSplitIndex,
+    base_block: u64,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Read headers from a snapshot file
-    Headers {
-        /// Path to the headers .seg file
-        #[arg(value_name = "FILE")]
-        snapshot: PathBuf,
+impl SnapshotReader {
+    fn new(
+        snapshot_dir: &Path,
+        range_start: u64,
+        range_end: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let range_str = format!("{:06}-{:06}", range_start / 1000, range_end / 1000);
 
-        /// Optional path to the .idx index file for fast lookups
-        #[arg(short, long)]
-        index: Option<PathBuf>,
+        let headers_seg =
+            Decompressor::new(snapshot_dir.join(format!("v1-{}-headers.seg", range_str)))?;
+        let headers_idx =
+            RecSplitIndex::open(&snapshot_dir.join(format!("v1-{}-headers.idx", range_str)))?;
 
-        /// Block number to look up (requires index)
-        #[arg(short, long)]
-        block: Option<u64>,
+        let bodies_seg =
+            Decompressor::new(snapshot_dir.join(format!("v1-{}-bodies.seg", range_str)))?;
+        let bodies_idx =
+            RecSplitIndex::open(&snapshot_dir.join(format!("v1-{}-bodies.idx", range_str)))?;
 
-        /// Number of headers to display (default: 10)
-        #[arg(short, long, default_value = "10")]
-        count: usize,
+        let transactions_seg =
+            Decompressor::new(snapshot_dir.join(format!("v1-{}-transactions.seg", range_str)))?;
+        let transactions_idx =
+            RecSplitIndex::open(&snapshot_dir.join(format!("v1-{}-transactions.idx", range_str)))?;
 
-        /// Skip this many headers before displaying
-        #[arg(short, long, default_value = "0")]
-        skip: usize,
-    },
+        let tx_to_block_idx = RecSplitIndex::open(
+            &snapshot_dir.join(format!("v1-{}-transactions-to-block.idx", range_str)),
+        )?;
 
-    /// Read bodies from a snapshot file
-    Bodies {
-        /// Path to the bodies .seg file
-        #[arg(value_name = "FILE")]
-        snapshot: PathBuf,
-
-        /// Optional path to the .idx index file
-        #[arg(short, long)]
-        index: Option<PathBuf>,
-    },
-
-    /// Read transactions from a snapshot file
-    Transactions {
-        /// Path to the transactions .seg file
-        #[arg(value_name = "FILE")]
-        snapshot: PathBuf,
-
-        /// Optional path to the .idx index file
-        #[arg(short, long)]
-        index: Option<PathBuf>,
-    },
-
-    /// Show information about a snapshot file
-    Info {
-        /// Path to the .seg file
-        #[arg(value_name = "FILE")]
-        snapshot: PathBuf,
-
-        /// Optional path to the .idx index file
-        #[arg(short, long)]
-        index: Option<PathBuf>,
-    },
-}
-
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // Set up logging
-    let log_level = if cli.debug { "debug" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
-
-    match cli.command {
-        Commands::Headers {
-            snapshot,
-            index,
-            block,
-            count,
-            skip,
-        } => read_headers(&snapshot, index.as_deref(), block, count, skip),
-        Commands::Bodies { snapshot, index } => {
-            println!("Bodies reading not yet implemented");
-            println!("Snapshot: {:?}", snapshot);
-            if let Some(idx) = index {
-                println!("Index: {:?}", idx);
-            }
-            Ok(())
-        }
-        Commands::Transactions { snapshot, index } => {
-            println!("Transactions reading not yet implemented");
-            println!("Snapshot: {:?}", snapshot);
-            if let Some(idx) = index {
-                println!("Index: {:?}", idx);
-            }
-            Ok(())
-        }
-        Commands::Info { snapshot, index } => show_info(&snapshot, index.as_deref()),
-    }
-}
-
-fn read_headers(
-    snapshot_path: &PathBuf,
-    index_path: Option<&Path>,
-    block_num: Option<u64>,
-    count: usize,
-    skip: usize,
-) -> Result<()> {
-    if !snapshot_path.exists() {
-        return Err(SnapshotError::InvalidPath(format!(
-            "Snapshot file not found: {:?}",
-            snapshot_path
-        )));
+        Ok(SnapshotReader {
+            headers_seg,
+            headers_idx,
+            bodies_seg,
+            bodies_idx,
+            transactions_seg,
+            transactions_idx,
+            tx_to_block_idx,
+            base_block: range_start,
+        })
     }
 
-    let reader = HeadersReader::new(snapshot_path)?;
-    println!("Opened snapshot with {} headers", reader.count());
+    fn read_header(&self, block_number: u64) -> Option<Header> {
+        let ordinal = block_number - self.base_block;
+        let offset = self.headers_idx.ordinal_lookup(ordinal)?;
 
-    // If block number specified, we need an index
-    if let Some(block) = block_num {
-        let idx_path = index_path.ok_or(SnapshotError::IndexNotAvailable)?;
-        if !idx_path.exists() {
-            return Err(SnapshotError::InvalidPath(format!(
-                "Index file not found: {:?}",
-                idx_path
-            )));
-        }
-
-        let index = IndexReader::new(idx_path)?;
-        println!("Loaded index with {} entries", index.key_count());
-
-        // Look up the block
-        let offset = index
-            .lookup(block)
-            .ok_or(SnapshotError::BlockNotFound(block))?;
-
-        println!("Block {} found at offset {}", block, offset);
-
-        // Read the header at that offset
-        let mut getter = reader.make_getter();
+        let mut getter = self.headers_seg.make_getter();
         getter.reset(offset);
 
-        if getter.has_next() {
-            let (hash, header) = getter.next()?;
-            print_header(block, &hash, &header);
+        if !getter.has_next() {
+            return None;
         }
-    } else {
-        // Sequential reading
-        let mut getter = reader.make_getter();
 
-        // Skip requested number of headers
-        for _ in 0..skip {
-            if !getter.has_next() {
-                break;
+        let (word, _) = getter.next(Vec::new());
+        if word.is_empty() || word.len() < 2 {
+            return None;
+        }
+
+        // Skip first byte (hash[0]) and decode header RLP
+        Header::decode(&mut &word[1..]).ok()
+    }
+
+    fn read_body(&self, block_number: u64) -> Option<Vec<u8>> {
+        let ordinal = block_number - self.base_block;
+        let offset = self.bodies_idx.ordinal_lookup(ordinal)?;
+
+        let mut getter = self.bodies_seg.make_getter();
+        getter.reset(offset);
+
+        if !getter.has_next() {
+            return None;
+        }
+
+        let (word, _) = getter.next(Vec::new());
+        if word.is_empty() {
+            None
+        } else {
+            Some(word)
+        }
+    }
+
+    fn read_transactions(&self, start_tx_id: u64, count: u64) -> Vec<Vec<u8>> {
+        let mut transactions = Vec::new();
+
+        for i in 0..count {
+            let tx_ordinal = start_tx_id + i;
+            if let Some(offset) = self.transactions_idx.ordinal_lookup(tx_ordinal) {
+                let mut getter = self.transactions_seg.make_getter();
+                getter.reset(offset);
+
+                if getter.has_next() {
+                    let (word, _) = getter.next(Vec::new());
+                    if !word.is_empty() {
+                        transactions.push(word);
+                    }
+                }
             }
-            getter.skip();
         }
 
-        // Read and display headers
-        let mut displayed = 0;
-        let mut _current_block = skip as u64; // Assuming sequential from 0
+        transactions
+    }
 
-        while getter.has_next() && displayed < count {
-            let (hash, header) = getter.next()?;
-            print_header(header.number, &hash, &header);
-            displayed += 1;
-            _current_block += 1;
+    fn get_stats(&self) -> SnapshotStats {
+        SnapshotStats {
+            headers_count: self.headers_idx.key_count(),
+            bodies_count: self.bodies_idx.key_count(),
+            transactions_count: self.transactions_idx.key_count(),
+            headers_data_size: self.headers_seg.size(),
+            bodies_data_size: self.bodies_seg.size(),
+            transactions_data_size: self.transactions_seg.size(),
+            base_block: self.base_block,
         }
-
-        if reader.count() > skip + count {
-            println!(
-                "\n... {} more headers in file",
-                reader.count() - skip - count
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn print_header(block_num: u64, hash: &alloy_primitives::B256, header: &alloy_consensus::Header) {
-    println!("\nBlock #{}", block_num);
-    println!("  Hash:       0x{}", hex::encode(&hash[..]));
-    println!("  Parent:     0x{}", hex::encode(&header.parent_hash[..]));
-
-    #[cfg(feature = "chrono")]
-    {
-        use chrono::DateTime;
-        let timestamp_str = DateTime::from_timestamp(header.timestamp as i64, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| "invalid".to_string());
-        println!("  Timestamp:  {} ({})", header.timestamp, timestamp_str);
-    }
-    #[cfg(not(feature = "chrono"))]
-    {
-        println!("  Timestamp:  {}", header.timestamp);
-    }
-
-    println!("  Gas limit:  {}", header.gas_limit);
-    println!("  Gas used:   {}", header.gas_used);
-    println!("  Difficulty: {}", header.difficulty);
-
-    if let Some(base_fee) = header.base_fee_per_gas {
-        println!("  Base fee:   {} gwei", base_fee / 1_000_000_000);
-    }
-
-    if let Some(blob_gas) = header.blob_gas_used {
-        println!("  Blob gas:   {}", blob_gas);
     }
 }
 
-fn show_info(snapshot_path: &PathBuf, index_path: Option<&Path>) -> Result<()> {
-    if !snapshot_path.exists() {
-        return Err(SnapshotError::InvalidPath(format!(
-            "Snapshot file not found: {:?}",
-            snapshot_path
-        )));
+struct SnapshotStats {
+    headers_count: u64,
+    bodies_count: u64,
+    transactions_count: u64,
+    headers_data_size: usize,
+    bodies_data_size: usize,
+    transactions_data_size: usize,
+    base_block: u64,
+}
+
+impl std::fmt::Display for SnapshotStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "=== Snapshot Statistics ===")?;
+        writeln!(f, "Base block: {}", self.base_block)?;
+        writeln!(
+            f,
+            "Headers: {} entries, {} bytes",
+            self.headers_count, self.headers_data_size
+        )?;
+        writeln!(
+            f,
+            "Bodies: {} entries, {} bytes",
+            self.bodies_count, self.bodies_data_size
+        )?;
+        writeln!(
+            f,
+            "Transactions: {} entries, {} bytes",
+            self.transactions_count, self.transactions_data_size
+        )?;
+        writeln!(
+            f,
+            "Total data: {} bytes",
+            self.headers_data_size + self.bodies_data_size + self.transactions_data_size
+        )?;
+        Ok(())
+    }
+}
+
+fn analyze_block_completeness(reader: &SnapshotReader, start_block: u64, count: u64) {
+    println!("=== Block Completeness Analysis ===");
+
+    let mut complete_blocks = 0;
+    let mut missing_headers = 0;
+    let mut missing_bodies = 0;
+
+    for i in 0..count {
+        let block_num = start_block + i;
+        let has_header = reader.read_header(block_num).is_some();
+        let has_body = reader.read_body(block_num).is_some();
+
+        match (has_header, has_body) {
+            (true, true) => complete_blocks += 1,
+            (false, true) => missing_headers += 1,
+            (true, false) => missing_bodies += 1,
+            (false, false) => {
+                // Both missing - don't count separately
+            }
+        }
     }
 
-    // Get file info
-    let metadata = std::fs::metadata(snapshot_path)?;
-    let file_size = metadata.len();
-
-    println!("Snapshot file: {:?}", snapshot_path);
+    println!("Blocks analyzed: {}", count);
+    println!("Complete blocks (header + body): {}", complete_blocks);
+    println!("Missing headers only: {}", missing_headers);
+    println!("Missing bodies only: {}", missing_bodies);
     println!(
-        "File size: {} bytes ({:.2} MB)",
-        file_size,
-        file_size as f64 / 1_048_576.0
+        "Completeness rate: {:.1}%",
+        (complete_blocks as f64 / count as f64) * 100.0
     );
+}
 
-    // Determine snapshot type from filename
-    let filename = snapshot_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
+fn sample_block_data(reader: &SnapshotReader, block_number: u64) {
+    println!("\n=== Sample Block Data: {} ===", block_number);
 
-    let snapshot_type = if filename.contains("headers") {
-        "Headers"
-    } else if filename.contains("bodies") {
-        "Bodies"
-    } else if filename.contains("transactions") {
-        "Transactions"
+    if let Some(header) = reader.read_header(block_number) {
+        println!("Header:");
+        println!("  Block number: {}", header.number);
+        println!("  Timestamp: {}", header.timestamp);
+        println!("  Hash: {:?}", header.hash_slow());
+        println!("  Parent hash: {:?}", header.parent_hash);
+        println!("  Gas used: {}", header.gas_used);
+        println!("  Gas limit: {}", header.gas_limit);
     } else {
-        "Unknown"
+        println!("Header: Missing or empty");
+    }
+
+    if let Some(body) = reader.read_body(block_number) {
+        println!("Body:");
+        println!("  Size: {} bytes", body.len());
+        println!("  First 20 bytes: {:02x?}", &body[..body.len().min(20)]);
+
+        // Try to decode the body RLP to count transactions
+        use alloy_consensus::TxEnvelope;
+        use alloy_rlp::Decodable;
+        if let Ok(body_decoded) = alloy_consensus::BlockBody::<TxEnvelope>::decode(&mut &body[..]) {
+            println!("  Transactions: {}", body_decoded.transactions.len());
+            println!(
+                "  Withdrawals: {}",
+                body_decoded.withdrawals.as_ref().map_or(0, |w| w.len())
+            );
+        } else {
+            println!("  Could not decode body RLP");
+        }
+    } else {
+        println!("Body: Missing or empty");
+    }
+}
+
+fn main() {
+    let snapshot_dir = Path::new("test_data/snapshots");
+
+    println!("Loading snapshots from: {:?}", snapshot_dir);
+
+    let reader = match SnapshotReader::new(snapshot_dir, 23070000, 23071000) {
+        Ok(reader) => reader,
+        Err(e) => {
+            eprintln!("Failed to load snapshots: {}", e);
+            return;
+        }
     };
 
-    println!("Type: {}", snapshot_type);
+    // Show statistics
+    println!("{}", reader.get_stats());
 
-    // Try to parse block range from filename (e.g., v1-000000-000500-headers.seg)
-    let captures = filename.split('-').collect::<Vec<_>>();
-    if captures.len() >= 4 {
-        if let (Ok(from), Ok(to)) = (captures[1].parse::<u64>(), captures[2].parse::<u64>()) {
-            println!("Block range: {} - {} ({} blocks)", from, to, to - from);
-        }
+    // Analyze completeness
+    analyze_block_completeness(&reader, 23070000, 1000);
+
+    // Sample some blocks
+    sample_block_data(&reader, 23070000); // First block
+    sample_block_data(&reader, 23070054); // Block we know has header
+    sample_block_data(&reader, 23070055); // Block we know has empty header
+    sample_block_data(&reader, 23070999); // Last block
+
+    println!("\n=== Transaction Analysis ===");
+    let tx_stats = reader.get_stats();
+    println!(
+        "Total transactions in snapshot: {}",
+        tx_stats.transactions_count
+    );
+
+    // Sample some transactions
+    println!("\nFirst 3 transactions:");
+    let first_txs = reader.read_transactions(0, 3);
+    for (i, tx) in first_txs.iter().enumerate() {
+        println!(
+            "  TX {}: {} bytes, first 10 bytes: {:02x?}",
+            i,
+            tx.len(),
+            &tx[..tx.len().min(10)]
+        );
     }
-
-    // Open and get info from decompressor
-    match snapshot_type {
-        "Headers" => {
-            let reader = HeadersReader::new(snapshot_path)?;
-            println!("Entries: {} headers", reader.count());
-        }
-        _ => {
-            println!("Entries: (reader not implemented for this type)");
-        }
-    }
-
-    // Check index file if provided
-    if let Some(idx_path) = index_path {
-        if !idx_path.exists() {
-            println!("\nIndex file not found: {:?}", idx_path);
-        } else {
-            let idx_metadata = std::fs::metadata(idx_path)?;
-            let idx_size = idx_metadata.len();
-
-            println!("\nIndex file: {:?}", idx_path);
-            println!(
-                "Index size: {} bytes ({:.2} KB)",
-                idx_size,
-                idx_size as f64 / 1024.0
-            );
-
-            let index = IndexReader::new(idx_path)?;
-            println!("Index entries: {}", index.key_count());
-            println!(
-                "Index type: {}",
-                if index.is_enum() {
-                    "Enum (sequential)"
-                } else {
-                    "Hash"
-                }
-            );
-        }
-    }
-
-    Ok(())
 }

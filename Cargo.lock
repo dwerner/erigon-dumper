@@ -1069,6 +1069,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "elias-fano"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd4d0f343ec564400ddb78a4d64ab7dd3617114cf4586efec034b70fda8b4045"
+dependencies = [
+ "fixedbitset",
+]
+
+[[package]]
 name = "elliptic-curve"
 version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1128,11 +1137,13 @@ dependencies = [
  "clap",
  "crc32fast",
  "criterion",
+ "elias-fano",
  "env_logger",
  "hex",
  "lazy_static",
  "log",
  "memmap2",
+ "murmur3",
  "proptest",
  "radix_trie",
  "rand 0.8.5",
@@ -1216,6 +1227,12 @@ dependencies = [
  "rustc-hex",
  "static_assertions",
 ]
+
+[[package]]
+name = "fixedbitset"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86d4de0081402f5e88cdac65c8dcdcc73118c1a7a465e2a05f0da05843a8ea33"
 
 [[package]]
 name = "fnv"
@@ -1611,6 +1628,12 @@ checksum = "483758ad303d734cec05e5c12b41d7e93e6a6390c5e9dae6bdeb7c1259012d28"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "murmur3"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9252111cf132ba0929b6f8e030cac2a24b507f3a4d6db6fb2896f27b354c714b"
 
 [[package]]
 name = "nibble_vec"

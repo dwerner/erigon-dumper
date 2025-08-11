@@ -26,6 +26,10 @@ cdivsufsort = "2.0"
 lazy_static = "1.4"
 radix_trie = "0.2"
 
+# Index reading dependencies  
+murmur3 = "0.5"
+elias-fano = "1.1"
+
 # Temp files (used in tests and ETL)
 tempfile = "3.14"
 

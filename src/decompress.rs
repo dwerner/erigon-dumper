@@ -386,6 +386,16 @@ impl Decompressor {
         self.empty_words_count as usize
     }
 
+    pub fn size(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Check if this decompressor uses pattern compression
+    /// Returns false if pattern dictionary is empty (uncompressed format)
+    pub fn is_compressed(&self) -> bool {
+        self.dict.is_some() && self.serialized_dict_size > 0
+    }
+
     // From Go: decompress.go:648
     pub fn make_getter(&self) -> Getter {
         let data = self.data[self.words_start as usize..].to_vec();
@@ -977,7 +987,7 @@ impl<'a> Getter<'a> {
     }
 
     // From Go: decompress.go:756-790
-    pub fn skip(&mut self) -> u64 {
+    pub fn skip(&mut self) -> (u64, usize) {
         log::debug!("skip() called at data_p={}", self.data_p);
         let mut word_len = self.next_pos(true);
         log::debug!("skip(): word_len raw={}", word_len);
@@ -993,8 +1003,10 @@ impl<'a> Getter<'a> {
                 self.data_bit = 0;
             }
             log::debug!("skip(): empty word, returning data_p={}", self.data_p);
-            return self.data_p;
+            return (self.data_p, 0);
         }
+
+        let word_len_int = word_len as usize;
 
         // Following Go's implementation exactly
         let mut add = 0u64;
@@ -1031,8 +1043,8 @@ impl<'a> Getter<'a> {
             self.data_bit = 0;
         }
 
-        if word_len as usize > last_uncovered {
-            add += (word_len as usize - last_uncovered) as u64;
+        if word_len_int > last_uncovered {
+            add += (word_len_int - last_uncovered) as u64;
         }
 
         // Uncovered characters
@@ -1045,7 +1057,85 @@ impl<'a> Getter<'a> {
                 [self.data_p as usize..std::cmp::min(self.data_p as usize + 10, self.data.len())]
         );
 
-        self.data_p
+        (self.data_p, word_len_int)
+    }
+
+    // From Go: decompress.go:740-753
+    pub fn next_uncompressed(&mut self) -> (Vec<u8>, u64) {
+        let mut word_len = self.next_pos(true);
+        if word_len > 0 {
+            word_len -= 1; // because when create huffman tree we do ++, because 0 is terminator
+        }
+
+        if word_len == 0 {
+            if self.data_bit > 0 {
+                self.data_p += 1;
+                self.data_bit = 0;
+            }
+            return (Vec::new(), self.data_p);
+        }
+
+        // Skip position data
+        self.next_pos(false);
+        if self.data_bit > 0 {
+            self.data_p += 1;
+            self.data_bit = 0;
+        }
+
+        // Read uncompressed data
+        let word = if self.data_p + word_len <= self.data.len() as u64 {
+            self.data[self.data_p as usize..(self.data_p + word_len) as usize].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        self.data_p += word_len;
+        (word, self.data_p)
+    }
+
+    // From Go: decompress.go:793-810
+    pub fn skip_uncompressed(&mut self) -> Result<(u64, usize), CompressionError> {
+        let mut word_len = self.next_pos(true);
+        if word_len > 0 {
+            word_len -= 1; // because when create huffman tree we do ++, because 0 is terminator
+        }
+
+        if word_len == 0 {
+            if self.data_bit > 0 {
+                self.data_p += 1;
+                self.data_bit = 0;
+            }
+            return Ok((self.data_p, 0));
+        }
+
+        // Skip position data
+        self.next_pos(false);
+        if self.data_bit > 0 {
+            self.data_p += 1;
+            self.data_bit = 0;
+        }
+
+        // Skip uncompressed data
+        self.data_p += word_len;
+        Ok((self.data_p, word_len as usize))
+    }
+
+    pub fn match_prefix_uncompressed(&self, _prefix: &[u8]) -> bool {
+        // For uncompressed data, we would need to peek at the data
+        // This is a simplified implementation
+        false
+    }
+
+    pub fn match_cmp(&self, _prefix: &[u8]) -> std::cmp::Ordering {
+        // For compressed data comparison
+        // This is a simplified implementation
+        std::cmp::Ordering::Equal
+    }
+
+    pub fn match_cmp_uncompressed(&self, _prefix: &[u8]) -> std::cmp::Ordering {
+        // For uncompressed data comparison
+        // This is a simplified implementation
+        std::cmp::Ordering::Equal
     }
 
     pub fn size(&self) -> usize {

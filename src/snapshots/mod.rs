@@ -1,6 +1,7 @@
 pub mod error;
 pub mod index;
 pub mod reader;
+pub mod recsplit;
 
 pub use error::{Result, SnapshotError};
 pub use index::IndexReader;

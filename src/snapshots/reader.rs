@@ -6,6 +6,8 @@ use alloy_rlp::Decodable;
 use std::path::Path;
 
 /// Reader for headers snapshot files
+/// Headers use direct Getter access without the Reader wrapper,
+/// as they are single items, not key-value pairs
 pub struct HeadersReader {
     decompressor: Decompressor,
     total_words: usize,
