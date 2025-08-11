@@ -32,6 +32,19 @@ tempfile = "3.14"
 # Hex encoding for display
 hex = "0.4"
 
+# CLI support (for binaries)
+clap = { version = "4.5", features = ["derive"], optional = true }
+chrono = { version = "0.4", optional = true }
+env_logger = { version = "0.10", optional = true }
+
+[features]
+default = []
+cli = ["clap", "chrono", "env_logger"]
+
+[[bin]]
+name = "snapshot-reader"
+required-features = ["cli"]
+
 [dev-dependencies]
 criterion = "0.5"
 smol-potat = "1.1"  # Minimal async runtime for tests
@@ -39,3 +52,4 @@ crc32fast = "1.4"  # For checksum tests matching Go
 env_logger = "0.10"  # For test logging
 proptest = "1.4"  # Property-based testing
 rand = "0.8"  # Random number generation for tests
+chrono = "0.4"  # For timestamp formatting in examples

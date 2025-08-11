@@ -2,6 +2,7 @@ pub mod compress;
 pub mod decompress;
 pub mod error;
 pub mod parallel_compress;
+pub mod snapshots;
 
 // Re-export main types
 pub use compress::{Cfg, Compressor, DictionaryBuilder, Pattern};

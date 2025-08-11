@@ -185,11 +185,11 @@ impl Decompressor {
         let pattern_dict_data = &data[24..24 + pattern_dict_size as usize];
         let dict_size = pattern_dict_data.len();
         let mut dict_pos = 0usize;
-        
+
         let mut depths = Vec::new();
         let mut patterns = Vec::new();
         let mut pattern_max_depth = 0u64;
-        
+
         // Read patterns from dictionary (Go: decompress.go:243-260)
         while dict_pos < dict_size {
             let (depth, ns) = decode_varint(&pattern_dict_data[dict_pos..])?;
@@ -199,32 +199,44 @@ impl Decompressor {
                     depth, MAX_ALLOWED_DEPTH
                 )));
             }
-            
+
             depths.push(depth);
             if depth > pattern_max_depth {
                 pattern_max_depth = depth;
             }
             dict_pos += ns;
-            
+
             let (pattern_size, ns) = decode_varint(&pattern_dict_data[dict_pos..])?;
             dict_pos += ns;
-            
+
             if dict_pos + pattern_size as usize > dict_size {
                 return Err(CompressionError::Other(
                     "Pattern size exceeds dictionary bounds".to_string(),
                 ));
             }
-            
+
             patterns.push(pattern_dict_data[dict_pos..dict_pos + pattern_size as usize].to_vec());
             dict_pos += pattern_size as usize;
         }
         let dict_words = patterns.len();
-        
+
         // Build pattern huffman tree (Go: decompress.go:263-275)
         let dict = if pattern_dict_size > 0 {
-            let bit_len = if pattern_max_depth > 9 { 9 } else { pattern_max_depth as usize };
+            let bit_len = if pattern_max_depth > 9 {
+                9
+            } else {
+                pattern_max_depth as usize
+            };
             let mut table = PatternTable::new(bit_len);
-            build_condensed_pattern_table(&depths, &patterns, &mut table, 0, 0, 0, pattern_max_depth)?;
+            build_condensed_pattern_table(
+                &depths,
+                &patterns,
+                &mut table,
+                0,
+                0,
+                0,
+                pattern_max_depth,
+            )?;
             Some(table)
         } else {
             None
@@ -253,11 +265,11 @@ impl Decompressor {
         let pos_dict_data = &data[pos_dict_start + 8..pos_dict_start + 8 + pos_dict_size as usize];
         let dict_size = pos_dict_data.len();
         let mut dict_pos = 0;
-        
+
         let mut pos_depths = Vec::new();
         let mut positions = Vec::new();
         let mut pos_max_depth = 0u64;
-        
+
         // Read positions from dictionary (Go: decompress.go:299-312)
         while dict_pos < dict_size {
             let (depth, ns) = decode_varint(&pos_dict_data[dict_pos..])?;
@@ -267,18 +279,18 @@ impl Decompressor {
                     depth, MAX_ALLOWED_DEPTH
                 )));
             }
-            
+
             pos_depths.push(depth);
             if depth > pos_max_depth {
                 pos_max_depth = depth;
             }
             dict_pos += ns;
-            
+
             let (pos, ns) = decode_varint(&pos_dict_data[dict_pos..])?;
             dict_pos += ns;
             positions.push(pos);
         }
-        
+
         // Debug logging for positions
         log::debug!(
             "Parsing position dictionary: {} positions, max_depth={}",
@@ -293,10 +305,14 @@ impl Decompressor {
                 positions[j]
             );
         }
-        
+
         // Build position huffman tree (Go: decompress.go:314-332)
         let pos_dict = if pos_dict_size > 0 {
-            let bit_len = if pos_max_depth > 9 { 9 } else { pos_max_depth as usize };
+            let bit_len = if pos_max_depth > 9 {
+                9
+            } else {
+                pos_max_depth as usize
+            };
             let mut table = PosTable::new(bit_len);
             build_pos_table_recursive(&pos_depths, &positions, &mut table, 0, 0, 0, pos_max_depth)?;
             Some(table)
@@ -468,7 +484,6 @@ fn build_condensed_pattern_table(
     )?;
     Ok(b0 + b1)
 }
-
 
 // Recursive position table builder (matching Go's buildPosTable exactly)
 fn build_pos_table_recursive(
@@ -1064,8 +1079,6 @@ fn build_condensed_word_distances() -> Vec<Vec<usize>> {
     }
     dist2
 }
-
-
 
 // Decode a varint from bytes
 fn decode_varint(data: &[u8]) -> Result<(u64, usize), CompressionError> {

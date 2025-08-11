@@ -658,8 +658,8 @@ pub struct Position {
 
 // From Go: PositionHuff struct (for Huffman tree)
 pub struct PositionHuff {
-    pub p0: Option<usize>,  // Index into positions array
-    pub p1: Option<usize>,  // Index into positions array
+    pub p0: Option<usize>, // Index into positions array
+    pub p1: Option<usize>, // Index into positions array
     pub h0: Option<Box<PositionHuff>>,
     pub h1: Option<Box<PositionHuff>>,
     pub uses: u64,
