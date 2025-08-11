@@ -387,6 +387,10 @@ impl DictionaryBuilder {
         self.items.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     // From Go: processWord method - compress.go:360-366
     pub fn process_word(&mut self, chars: Vec<u8>, score: u64) {
         // Push new pattern to heap
@@ -841,6 +845,12 @@ pub struct Ring {
     count: usize,
 }
 
+impl Default for Ring {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Ring {
     pub fn new() -> Self {
         // Go: compress.go:691-697
@@ -924,6 +934,10 @@ impl Ring {
         self.count
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     // From Go: Get - compress.go:747-752
     pub fn get(&mut self, i: usize) -> &mut DynamicCell {
         if i >= self.count {
@@ -945,6 +959,12 @@ impl Ring {
 pub struct SimplePatternCollector {
     patterns: std::collections::HashMap<Vec<u8>, u64>, // pattern -> accumulated score
     total_patterns: usize,
+}
+
+impl Default for SimplePatternCollector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SimplePatternCollector {
@@ -972,6 +992,10 @@ impl SimplePatternCollector {
     pub fn len(&self) -> usize {
         self.patterns.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
 }
 
 // From Go: DictAggregator struct
@@ -981,6 +1005,12 @@ pub struct DictAggregator {
     received_words: usize,
     last_word: Vec<u8>,
     last_word_score: u64,
+}
+
+impl Default for DictAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DictAggregator {

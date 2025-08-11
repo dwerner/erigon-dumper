@@ -42,7 +42,6 @@ impl std::fmt::Display for FileCompression {
                 FileCompression::None => "none",
                 FileCompression::Keys => "k",
                 FileCompression::Vals => "v",
-                _ => "",
             }
         };
         write!(f, "{}", s)

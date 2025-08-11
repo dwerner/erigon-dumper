@@ -784,9 +784,7 @@ impl<'a> Getter<'a> {
         let mut word_len = self.next_pos(true);
         log::debug!("Got word_len (raw): {}", word_len);
 
-        if word_len > 0 {
-            word_len -= 1; // because when creating huffman tree we do ++, because 0 is terminator
-        }
+        word_len = word_len.saturating_sub(1); // because when creating huffman tree we do ++, because 0 is terminator
         log::debug!("Adjusted word_len: {}", word_len);
 
         if word_len == 0 {
@@ -992,9 +990,7 @@ impl<'a> Getter<'a> {
         let mut word_len = self.next_pos(true);
         log::debug!("skip(): word_len raw={}", word_len);
 
-        if word_len > 0 {
-            word_len -= 1; // because when create huffman tree we do ++, because 0 is terminator
-        }
+        word_len = word_len.saturating_sub(1); // because when create huffman tree we do ++, because 0 is terminator
         log::debug!("skip(): word_len adjusted={}", word_len);
 
         if word_len == 0 {
@@ -1063,9 +1059,7 @@ impl<'a> Getter<'a> {
     // From Go: decompress.go:740-753
     pub fn next_uncompressed(&mut self) -> (Vec<u8>, u64) {
         let mut word_len = self.next_pos(true);
-        if word_len > 0 {
-            word_len -= 1; // because when create huffman tree we do ++, because 0 is terminator
-        }
+        word_len = word_len.saturating_sub(1); // because when create huffman tree we do ++, because 0 is terminator
 
         if word_len == 0 {
             if self.data_bit > 0 {
@@ -1096,9 +1090,7 @@ impl<'a> Getter<'a> {
     // From Go: decompress.go:793-810
     pub fn skip_uncompressed(&mut self) -> Result<(u64, usize), CompressionError> {
         let mut word_len = self.next_pos(true);
-        if word_len > 0 {
-            word_len -= 1; // because when create huffman tree we do ++, because 0 is terminator
-        }
+        word_len = word_len.saturating_sub(1); // because when create huffman tree we do ++, because 0 is terminator
 
         if word_len == 0 {
             if self.data_bit > 0 {
