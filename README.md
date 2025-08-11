@@ -9,7 +9,7 @@ A Rust library for reading Erigon's compressed blockchain snapshot data, featuri
 - **Complete snapshot reading**: Headers, bodies, and transactions from Erigon snapshot files
 - **Elias-Fano index decoding**: Efficient ordinal lookups with 98.4% success rate
 - **RecSplit index support**: Perfect hash index reading for O(1) lookups
-- **Zero-copy access**: Memory-mapped files with bytemuck for performance
+- **Zero-copy access**: Memory-mapped files for performance
 - **Dictionary decompression**: Full implementation of Erigon's compression algorithm
 - **Alloy compatibility**: Uses alloy-consensus types for Ethereum data structures
 
