@@ -24,13 +24,13 @@ The library provides:
 
 ## Implementation Status
 
-✅ Complete snapshot reading (headers, bodies, transactions)
-✅ Elias-Fano index decoding matching Go implementation
-✅ Dictionary-based decompression with pattern matching
-✅ RecSplit index parsing and ordinal lookups
-✅ Memory-mapped file access with zero-copy reads
-✅ Integration with real Erigon snapshot files
-✅ 98.4% header decode success rate (984/1000 blocks)
+* Complete snapshot reading (headers, bodies, transactions)
+* Elias-Fano index decoding matching Go implementation
+* Dictionary-based decompression with pattern matching
+* RecSplit index parsing and ordinal lookups
+* Memory-mapped file access with zero-copy reads
+* Integration with real Erigon snapshot files
+* 98.4% header decode success rate (984/1000 blocks)
 
 ## Reference Implementation
 

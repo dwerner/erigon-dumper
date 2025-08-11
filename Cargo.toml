@@ -15,9 +15,11 @@ memmap2 = "0.9"
 
 # Error handling
 thiserror = "2.0"
+log = "0.4"
 
 # Compression dependencies
 cdivsufsort = "2.0"
+lazy_static = "1.4"
 radix_trie = "0.2"
 
 # Index reading dependencies  
